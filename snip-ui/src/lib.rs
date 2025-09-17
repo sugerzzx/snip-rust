@@ -1,5 +1,5 @@
-use iced::{Application, Command, Element, Settings, Theme, window};
 use iced::widget::{button, column, text};
+use iced::{window, Application, Command, Element, Settings, Theme};
 
 pub fn run() -> iced::Result {
     SnipApp::run(Settings {
@@ -51,10 +51,10 @@ impl Application for SnipApp {
 
     fn view(&self) -> Element<Message> {
         column![
-            text("欢迎使用 Snip Rust 截图工具").size(32),
-            text(format!("计数器: {}", self.counter)).size(20),
-            button("增加").on_press(Message::IncrementPressed),
-            button("减少").on_press(Message::DecrementPressed),
+            text("Snip Rust Screenshot Tool").size(32),
+            text(format!("Counter: {}", self.counter)).size(20),
+            button("Increment").on_press(Message::IncrementPressed),
+            button("Decrement").on_press(Message::DecrementPressed),
         ]
         .padding(20)
         .spacing(20)
