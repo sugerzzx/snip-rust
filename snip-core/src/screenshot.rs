@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use screenshots::Screen;
+use std::env;
 use std::io::Cursor;
 
 #[derive(Debug, Clone, Copy)]
@@ -18,8 +19,9 @@ pub fn capture_fullscreen() -> Result<Vec<u8>> {
         .capture()
         .map_err(|e| anyhow!("capture failed: {e}"))?; // RgbaImage
     let raw = img.as_raw();
-    // 如果平台返回 BGRA，这里需要转换；screenshots 0.8 在 Windows 返回 BGRA 顺序
-    let rgba = bgra_to_rgba(raw, img.width(), img.height());
+    // 经验：screenshots 0.8 在当前平台实际返回 RGBA，之前误当 BGRA 导致偏色。
+    // 如果用户设置 SNIP_FORCE_BGRA=1 则执行 BGRA->RGBA 转换。
+    let rgba = maybe_convert_bgra(raw, img.width(), img.height());
     encode_png(&rgba, img.width(), img.height())
 }
 
@@ -41,7 +43,7 @@ pub fn capture_area(rect: Rect) -> Result<Vec<u8>> {
     let crop_w = rect.width.min(max_w);
     let crop_h = rect.height.min(max_h);
 
-    let rgba_full = bgra_to_rgba(img.as_raw(), img.width(), img.height());
+    let rgba_full = maybe_convert_bgra(img.as_raw(), img.width(), img.height());
     let mut cropped: Vec<u8> = Vec::with_capacity((crop_w * crop_h * 4) as usize);
     for row in 0..crop_h {
         let start = (((rel_y + row) * img.width()) + rel_x) as usize * 4;
@@ -65,6 +67,15 @@ fn bgra_to_rgba(bgra: &[u8], w: u32, h: u32) -> Vec<u8> {
         out.resize((w * h * 4) as usize, 0);
     }
     out
+}
+
+fn maybe_convert_bgra(raw: &[u8], w: u32, h: u32) -> Vec<u8> {
+    if env::var("SNIP_FORCE_BGRA").is_ok() {
+        bgra_to_rgba(raw, w, h)
+    } else {
+        // 直接克隆为 RGBA
+        raw.to_vec()
+    }
 }
 
 fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
