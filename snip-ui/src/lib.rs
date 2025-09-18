@@ -16,15 +16,12 @@ pub fn run() -> iced::Result {
 
 #[derive(Default)]
 struct SnipApp {
-    counter: i32,
     screenshot: Option<image::Handle>,
     scale: f32,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    IncrementPressed,
-    DecrementPressed,
     TakeScreenshot,
     ScreenshotOk(Vec<u8>),
     ScreenshotErr,
@@ -52,12 +49,6 @@ impl Application for SnipApp {
 
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
-            Message::IncrementPressed => {
-                self.counter += 1;
-            }
-            Message::DecrementPressed => {
-                self.counter -= 1;
-            }
             Message::TakeScreenshot => {
                 return Command::perform(async move { capture_fullscreen() }, |res| match res {
                     Ok(p) => Message::ScreenshotOk(p),
@@ -87,9 +78,6 @@ impl Application for SnipApp {
         } else {
             column![
                 text("Snip Rust Screenshot Tool").size(32),
-                text(format!("Counter: {}", self.counter)).size(20),
-                button("Increment").on_press(Message::IncrementPressed),
-                button("Decrement").on_press(Message::DecrementPressed),
                 button("Take Screenshot and Show").on_press(Message::TakeScreenshot),
             ]
             .padding(20)
