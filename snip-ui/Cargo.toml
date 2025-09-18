@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-iced = "0.10"
+iced = { version = "0.10", features = ["image", "advanced"] }
 tray-item = "0.8"
 snip-core = { path = "../snip-core" }
 tokio = { version = "1.0", features = ["full"] }
