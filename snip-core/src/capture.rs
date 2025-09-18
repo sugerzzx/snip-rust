@@ -86,25 +86,6 @@ fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-// 兼容旧接口的管理器包装
-pub struct ScreenshotManager;
-impl ScreenshotManager {
-    pub fn new() -> Self {
-        Self
-    }
-    pub fn capture_screen(&self) -> Result<Vec<u8>> {
-        capture_fullscreen()
-    }
-    pub fn capture_area(&self, x: i32, y: i32, width: u32, height: u32) -> Result<Vec<u8>> {
-        capture_area(Rect {
-            x,
-            y,
-            width,
-            height,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,7 +109,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_fullscreen_runtime_capture() {
         let png = capture_fullscreen().unwrap();
         assert!(png.len() > 100); // 粗略检查

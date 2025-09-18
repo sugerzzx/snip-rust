@@ -1,5 +1,5 @@
+pub mod capture;
 pub mod hotkey;
-pub mod screenshot;
 
+pub use capture::*;
 pub use hotkey::*;
-pub use screenshot::*;
