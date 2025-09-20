@@ -1,13 +1,18 @@
-use iced::widget::{button, column, container, image, text};
-use iced::{window, Application, Command, Element, Settings, Theme};
+use iced::{
+    mouse, subscription,
+    widget::{button, column, container, image, text},
+    window::{self, Position},
+    Application, Command, Element, Event, Point, Settings, Subscription, Theme,
+};
 use snip_core::capture_fullscreen;
-// use anyhow::Result; // 当前未使用
 
 pub fn run() -> iced::Result {
     SnipApp::run(Settings {
         window: window::Settings {
             size: (800, 600),
-            position: window::Position::Centered,
+            position: Position::Centered,
+            decorations: false,
+            level: window::Level::AlwaysOnTop,
             ..Default::default()
         },
         ..Default::default()
@@ -17,7 +22,7 @@ pub fn run() -> iced::Result {
 #[derive(Default)]
 struct SnipApp {
     screenshot: Option<image::Handle>,
-    scale: f32,
+    dragging: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +30,10 @@ enum Message {
     TakeScreenshot,
     ScreenshotOk(Vec<u8>),
     ScreenshotErr,
+    MouseDown,
+    MouseUp,
+    MouseMoved(Point),
+    Noop,
 }
 
 impl Application for SnipApp {
@@ -36,7 +45,6 @@ impl Application for SnipApp {
     fn new(_flags: ()) -> (Self, Command<Message>) {
         (
             Self {
-                scale: 1.0,
                 ..Default::default()
             },
             Command::none(),
@@ -59,22 +67,21 @@ impl Application for SnipApp {
                 self.screenshot = Some(image::Handle::from_memory(png));
             }
             Message::ScreenshotErr => { /* TODO: 错误提示 */ }
+            Message::MouseDown => {
+                self.dragging = true;
+            }
+            Message::MouseUp => {
+                self.dragging = false;
+            }
+            Message::MouseMoved(Point) => {}
+            Message::Noop => {}
         }
         Command::none()
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         if let Some(img) = &self.screenshot {
-            container(
-                column![
-                    text("Screenshot Result:"),
-                    image(img.clone()),
-                    button("Retake Screenshot").on_press(Message::TakeScreenshot),
-                ]
-                .spacing(10)
-                .padding(10),
-            )
-            .into()
+            container(column![image(img.clone()),].spacing(10).padding(10)).into()
         } else {
             column![
                 text("Snip Rust Screenshot Tool").size(32),
@@ -88,5 +95,14 @@ impl Application for SnipApp {
 
     fn theme(&self) -> Theme {
         Theme::Light
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        subscription::events().map(|event| match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => Message::MouseDown,
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Message::MouseUp,
+            Event::Mouse(mouse::Event::CursorMoved { position }) => Message::MouseMoved(position),
+            _ => Message::Noop,
+        })
     }
 }
