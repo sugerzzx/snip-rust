@@ -1,4 +1,4 @@
-use snip_core::capture::{capture_area, capture_fullscreen, Rect};
+use snip_rust::capture::{capture_area, capture_fullscreen, Rect};
 use std::fs;
 
 fn main() -> anyhow::Result<()> {

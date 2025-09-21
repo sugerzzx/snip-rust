@@ -1,22 +1,19 @@
-[workspace]
-members = ["snip-core", "snip-ui"]
-resolver = "2"
-
 [package]
 name = "snip_rust"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "snip_rust"
+path = "src/lib.rs"
+
 [dependencies]
-snip-core = { path = "snip-core" }
-snip-ui = { path = "snip-ui" }
-iced = "0.10"
-screenshots = "0.1"
-image = "0.24"
-global-hotkey = "0.5"
-tray-item = "0.8"
-tokio = { version = "1.0", features = ["full"] }
-log = "0.4"
-env_logger = "0.10"
-anyhow = "1.0"
-thiserror = "1.0"
+anyhow = "1.0.100"
+env_logger = "0.11.8"
+image = "0.25.8"
+screenshots = "0.8.10"
+winit = "0.30.12"
+
+[[example]]
+name = "capture_demo"
+path = "examples/capture_demo.rs"

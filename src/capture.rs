@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
+use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
 use screenshots::Screen;
 use std::env;
 use std::io::Cursor;
@@ -82,7 +82,7 @@ fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     let cursor = Cursor::new(&mut data);
     let encoder = PngEncoder::new(cursor);
-    encoder.write_image(rgba, w, h, ColorType::Rgba8)?;
+    encoder.write_image(rgba, w, h, ExtendedColorType::Rgba8)?;
     Ok(data)
 }
 
