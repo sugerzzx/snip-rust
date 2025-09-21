@@ -25,6 +25,32 @@ pub fn capture_fullscreen() -> Result<Vec<u8>> {
     encode_png(&rgba, img.width(), img.height())
 }
 
+/// 返回原始 RGBA 像素及尺寸 (width,height,Vec<u8>)，供后续 UI 直接使用。
+pub fn capture_fullscreen_raw() -> Result<(u32, u32, Vec<u8>)> {
+    let screen = Screen::from_point(0, 0).map_err(|e| anyhow!("detect screen failed: {e}"))?;
+    let img = screen
+        .capture()
+        .map_err(|e| anyhow!("capture failed: {e}"))?;
+    let rgba = maybe_convert_bgra(img.as_raw(), img.width(), img.height());
+    Ok((img.width(), img.height(), rgba))
+}
+
+/// 返回包含显示器原点坐标的原始数据 (origin_x, origin_y, width, height, RGBA Vec)
+pub fn capture_fullscreen_raw_with_origin() -> Result<(i32, i32, u32, u32, Vec<u8>)> {
+    let screen = Screen::from_point(0, 0).map_err(|e| anyhow!("detect screen failed: {e}"))?;
+    let img = screen
+        .capture()
+        .map_err(|e| anyhow!("capture failed: {e}"))?;
+    let rgba = maybe_convert_bgra(img.as_raw(), img.width(), img.height());
+    Ok((
+        screen.display_info.x,
+        screen.display_info.y,
+        img.width(),
+        img.height(),
+        rgba,
+    ))
+}
+
 /// 区域截图（跨屏时暂以包含左上角的屏幕为准）
 pub fn capture_area(rect: Rect) -> Result<Vec<u8>> {
     let screen = Screen::from_point(rect.x, rect.y)

@@ -10,9 +10,14 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1.0.100"
 env_logger = "0.11.8"
+global-hotkey = "0.7.0"
 image = "0.25.8"
 screenshots = "0.8.10"
-winit = "0.30.12"
+winit = { version = "0.30.12", features = ["rwh_05"] }
+log = "0.4"
+softbuffer = "0.4.0"
+tiny-skia = "0.11.4"
+bytemuck = { version = "1.16", features = ["derive"] }
 
 [[example]]
 name = "capture_demo"
