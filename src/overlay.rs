@@ -15,11 +15,14 @@ pub struct OverlayState {
     surface: Surface<&'static Window, &'static Window>,
     pub visible: bool,
     pub screenshot: Option<(u32, u32, Vec<u8>)>, // 原始 RGBA 像素
-    origin: (i32, i32),                         // 此截图对应显示器的原点（全局坐标）
-    dim_cache: Option<Vec<u32>>,                // 预计算的 BGRA+变暗 缓冲，提升重绘性能
+    origin: (i32, i32),                          // 此截图对应显示器的原点（全局坐标）
+    dim_cache: Option<Vec<u32>>,                 // 预计算的 BGRA+变暗 缓冲，提升重绘性能
     drag_start: Option<(f64, f64)>,
     last_cursor: (f64, f64),
     pub selection: Option<(u32, u32, u32, u32)>, // 选区：x,y,w,h（相对窗口左上）
+    move_offset: Option<(i32, i32)>,             // 移动现有选区时，光标相对选区左上角偏移
+    mode: OverlayMode,
+    resize_handle: Option<ResizeHandle>, // 当前正在拖拽的缩放手柄
 }
 
 impl OverlayState {
@@ -53,6 +56,9 @@ impl OverlayState {
             drag_start: None,
             last_cursor: (0.0, 0.0),
             selection: None,
+            move_offset: None,
+            mode: OverlayMode::Idle,
+            resize_handle: None,
         })
     }
 
@@ -69,6 +75,8 @@ impl OverlayState {
         self.selection = None;
         self.drag_start = None;
         self.visible = true;
+        // 初始进入 Idle，等待第一次按下再进入 Dragging，避免“首次拖拽无响应”
+        self.mode = OverlayMode::Idle;
         self.window.set_visible(true);
         // 定位窗口，使其左上与显示器原点对齐
         self.window
@@ -97,30 +105,207 @@ impl OverlayState {
                 ..
             } => match state {
                 ElementState::Pressed => {
-                    self.drag_start = Some(self.last_cursor);
-                    self.selection = None;
+                    match self.mode {
+                        OverlayMode::Idle => {
+                            // 启动新建选区
+                            self.drag_start = Some(self.last_cursor);
+                            self.selection = None;
+                            self.mode = OverlayMode::Dragging;
+                            self.window.request_redraw();
+                        }
+                        OverlayMode::IdleWithSelection => {
+                            if let Some((x, y, w, h)) = self.selection {
+                                let (cx, cy) =
+                                    (self.last_cursor.0 as i32, self.last_cursor.1 as i32);
+                                // 先检测手柄
+                                if let Some(handle) = hit_test_handle(cx, cy, x, y, w, h) {
+                                    self.resize_handle = Some(handle);
+                                    self.mode = OverlayMode::Resizing;
+                                } else if cx >= x as i32
+                                    && cy >= y as i32
+                                    && cx < (x + w) as i32
+                                    && cy < (y + h) as i32
+                                {
+                                    // 在选区内部 -> 进入移动模式
+                                    self.move_offset = Some((cx - x as i32, cy - y as i32));
+                                    self.mode = OverlayMode::MovingSelection;
+                                } else {
+                                    // Outside: 忽略
+                                }
+                            }
+                        }
+                        OverlayMode::Dragging
+                        | OverlayMode::MovingSelection
+                        | OverlayMode::Resizing
+                        | OverlayMode::Annotating => {}
+                    }
                 }
                 ElementState::Released => {
-                    let png = self.take_selection_png();
-                    if png.as_ref().map(|v| v.len()).unwrap_or(0) > 0 {
-                        let out = png.unwrap();
-                        self.hide();
-                        return OverlayAction::SelectionFinished(out);
-                    } else {
-                        self.hide();
-                        return OverlayAction::Canceled;
+                    match self.mode {
+                        OverlayMode::Dragging => {
+                            // 结束新建选区
+                            self.drag_start = None;
+                            if self.selection.is_some() {
+                                self.mode = OverlayMode::IdleWithSelection;
+                            } else {
+                                self.mode = OverlayMode::Idle;
+                            }
+                        }
+                        OverlayMode::MovingSelection => {
+                            // 完成移动
+                            self.move_offset = None;
+                            self.mode = OverlayMode::IdleWithSelection;
+                        }
+                        OverlayMode::Resizing => {
+                            self.resize_handle = None;
+                            self.mode = OverlayMode::IdleWithSelection;
+                        }
+                        _ => {}
                     }
                 }
             },
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = (position.x, position.y);
-                if let Some((sx, sy)) = self.drag_start {
-                    let x0 = sx.min(position.x);
-                    let y0 = sy.min(position.y);
-                    let w = (sx - position.x).abs();
-                    let h = (sy - position.y).abs();
-                    self.selection = Some((x0 as u32, y0 as u32, w as u32, h as u32));
-                    self.window.request_redraw();
+                match self.mode {
+                    OverlayMode::Dragging => {
+                        if let Some((sx, sy)) = self.drag_start {
+                            let x0 = sx.min(position.x);
+                            let y0 = sy.min(position.y);
+                            let w = (sx - position.x).abs();
+                            let h = (sy - position.y).abs();
+                            self.selection = Some((x0 as u32, y0 as u32, w as u32, h as u32));
+                            self.window.request_redraw();
+                        }
+                    }
+                    OverlayMode::MovingSelection => {
+                        if let (Some((sw, sh, _)), Some((_x, _y, w, h)), Some((ox, oy))) =
+                            (self.screenshot.as_ref(), self.selection, self.move_offset)
+                        {
+                            let cx = position.x as i32;
+                            let cy = position.y as i32;
+                            let mut new_x = cx - ox;
+                            let mut new_y = cy - oy;
+                            // Clamp within screenshot bounds
+                            if new_x < 0 {
+                                new_x = 0;
+                            }
+                            if new_y < 0 {
+                                new_y = 0;
+                            }
+                            let max_x = (*sw as i32 - w as i32).max(0);
+                            let max_y = (*sh as i32 - h as i32).max(0);
+                            if new_x > max_x {
+                                new_x = max_x;
+                            }
+                            if new_y > max_y {
+                                new_y = max_y;
+                            }
+                            self.selection = Some((new_x as u32, new_y as u32, w, h));
+                            self.window.request_redraw();
+                        }
+                    }
+                    OverlayMode::Resizing => {
+                        if let (Some((sw, sh, _)), Some((sx, sy, w, h)), Some(handle)) =
+                            (self.screenshot.as_ref(), self.selection, self.resize_handle)
+                        {
+                            let cx = position.x as i32;
+                            let cy = position.y as i32;
+                            let mut x = sx as i32;
+                            let mut y = sy as i32;
+                            let mut rw = w as i32;
+                            let mut rh = h as i32;
+                            const MIN: i32 = 4;
+                            match handle {
+                                ResizeHandle::TopLeft => {
+                                    let nx = cx.clamp(0, (sx + w) as i32 - MIN);
+                                    let ny = cy.clamp(0, (sy + h) as i32 - MIN);
+                                    rw = (x + rw - nx).max(MIN);
+                                    rh = (y + rh - ny).max(MIN);
+                                    x = nx;
+                                    y = ny;
+                                }
+                                ResizeHandle::Top => {
+                                    let ny = cy.clamp(0, (sy + h) as i32 - MIN);
+                                    rh = (y + rh - ny).max(MIN);
+                                    y = ny;
+                                }
+                                ResizeHandle::TopRight => {
+                                    let ny = cy.clamp(0, (sy + h) as i32 - MIN);
+                                    let nx2 = cx.clamp(sx as i32 + MIN, *sw as i32 - 1);
+                                    rw = (nx2 - x + 1).max(MIN);
+                                    rh = (y + rh - ny).max(MIN);
+                                    y = ny;
+                                }
+                                ResizeHandle::Right => {
+                                    let nx2 = cx.clamp(sx as i32 + MIN, *sw as i32 - 1);
+                                    rw = (nx2 - x + 1).max(MIN);
+                                }
+                                ResizeHandle::BottomRight => {
+                                    let nx2 = cx.clamp(sx as i32 + MIN, *sw as i32 - 1);
+                                    let ny2 = cy.clamp(sy as i32 + MIN, *sh as i32 - 1);
+                                    rw = (nx2 - x + 1).max(MIN);
+                                    rh = (ny2 - y + 1).max(MIN);
+                                }
+                                ResizeHandle::Bottom => {
+                                    let ny2 = cy.clamp(sy as i32 + MIN, *sh as i32 - 1);
+                                    rh = (ny2 - y + 1).max(MIN);
+                                }
+                                ResizeHandle::BottomLeft => {
+                                    let nx = cx.clamp(0, (sx + w) as i32 - MIN);
+                                    let ny2 = cy.clamp(sy as i32 + MIN, *sh as i32 - 1);
+                                    rw = (x + rw - nx).max(MIN);
+                                    rh = (ny2 - y + 1).max(MIN);
+                                    x = nx;
+                                }
+                                ResizeHandle::Left => {
+                                    let nx = cx.clamp(0, (sx + w) as i32 - MIN);
+                                    rw = (x + rw - nx).max(MIN);
+                                    x = nx;
+                                }
+                            }
+                            // Clamp最终
+                            if x < 0 {
+                                x = 0;
+                            }
+                            if y < 0 {
+                                y = 0;
+                            }
+                            if x + rw > *sw as i32 {
+                                rw = *sw as i32 - x;
+                            }
+                            if y + rh > *sh as i32 {
+                                rh = *sh as i32 - y;
+                            }
+                            self.selection = Some((x as u32, y as u32, rw as u32, rh as u32));
+                            self.window.request_redraw();
+                        }
+                    }
+                    OverlayMode::IdleWithSelection => {
+                        // 更新光标形状：在选区内部 -> Move, 否则 Default
+                        if let Some((x, y, w, h)) = self.selection {
+                            let (cx, cy) = (position.x as i32, position.y as i32);
+                            if let Some(handle) = hit_test_handle(cx, cy, x, y, w, h) {
+                                // 根据手柄类型换不同光标
+                                use winit::window::CursorIcon::*;
+                                let icon = match handle {
+                                    ResizeHandle::Top | ResizeHandle::Bottom => NsResize,
+                                    ResizeHandle::Left | ResizeHandle::Right => EwResize,
+                                    ResizeHandle::TopLeft | ResizeHandle::BottomRight => NwseResize,
+                                    ResizeHandle::TopRight | ResizeHandle::BottomLeft => NeswResize,
+                                };
+                                self.window.set_cursor(icon);
+                            } else if cx >= x as i32
+                                && cy >= y as i32
+                                && cx < (x + w) as i32
+                                && cy < (y + h) as i32
+                            {
+                                self.window.set_cursor(winit::window::CursorIcon::Move);
+                            } else {
+                                self.window.set_cursor(winit::window::CursorIcon::Default);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -136,9 +321,10 @@ impl OverlayState {
             let size = self.window.inner_size();
             let width = size.width.max(1);
             let height = size.height.max(1);
-            let _ = self
-                .surface
-                .resize(NonZeroU32::new(width).unwrap(), NonZeroU32::new(height).unwrap());
+            let _ = self.surface.resize(
+                NonZeroU32::new(width).unwrap(),
+                NonZeroU32::new(height).unwrap(),
+            );
             if let Ok(mut frame) = self.surface.buffer_mut() {
                 if let Some(cache) = &self.dim_cache {
                     let copy_w = sw.min(width);
@@ -158,6 +344,35 @@ impl OverlayState {
                     let x2 = (x + w).saturating_sub(1);
                     let y2 = (y + h).saturating_sub(1);
                     if w > 0 && h > 0 {
+                        // 恢复选区内部为原始亮度（使用原始 screenshot）
+                        if matches!(
+                            self.mode,
+                            OverlayMode::Dragging
+                                | OverlayMode::IdleWithSelection
+                                | OverlayMode::MovingSelection
+                                | OverlayMode::Resizing
+                        ) {
+                            if let Some((sw, sh, ref rgba)) = &self.screenshot {
+                                let copy_w = w.min(sw - x).min(width - x);
+                                let copy_h = h.min(sh - y).min(height - y);
+                                for row in 0..copy_h {
+                                    let src_row = (y + row) * sw;
+                                    let dst_row = (y + row) * width;
+                                    let src_start = (src_row + x) as usize * 4;
+                                    let src_slice =
+                                        &rgba[src_start..src_start + (copy_w as usize) * 4];
+                                    for col in 0..copy_w {
+                                        let rgba_idx = (col as usize) * 4;
+                                        let r = src_slice[rgba_idx];
+                                        let g = src_slice[rgba_idx + 1];
+                                        let b = src_slice[rgba_idx + 2];
+                                        let a = src_slice[rgba_idx + 3];
+                                        frame[(dst_row + x + col) as usize] =
+                                            u32::from_le_bytes([b, g, r, a]);
+                                    }
+                                }
+                            }
+                        }
                         // 水平线
                         for i in x..=x2.min(width - 1) {
                             let top = (y.min(height - 1) * width + i) as usize;
@@ -173,6 +388,22 @@ impl OverlayState {
                             let right_x = x2.min(width - 1);
                             let right = (j * width + right_x) as usize;
                             frame[right] = 0xFFFFFFFF;
+                        }
+                        // 绘制 8 个缩放手柄 (小方块 6x6)
+                        let handle_size: i32 = 6;
+                        let hs2 = handle_size / 2;
+                        let centers = [
+                            (x as i32, y as i32),                     // TL
+                            ((x + w / 2) as i32, y as i32),           // T
+                            ((x + w) as i32 - 1, y as i32),           // TR
+                            ((x + w) as i32 - 1, (y + h / 2) as i32), // R
+                            ((x + w) as i32 - 1, (y + h) as i32 - 1), // BR
+                            ((x + w / 2) as i32, (y + h) as i32 - 1), // B
+                            (x as i32, (y + h) as i32 - 1),           // BL
+                            (x as i32, (y + h / 2) as i32),           // L
+                        ];
+                        for (cx, cy) in centers {
+                            draw_handle(&mut frame, width, height, cx, cy, hs2);
                         }
                     }
                 }
@@ -236,6 +467,71 @@ pub enum OverlayAction {
     None,
     SelectionFinished(Vec<u8>),
     Canceled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayMode {
+    Idle,
+    Dragging,
+    MovingSelection,
+    Resizing,
+    IdleWithSelection,
+    Annotating,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeHandle {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+}
+
+fn hit_test_handle(cx: i32, cy: i32, x: u32, y: u32, w: u32, h: u32) -> Option<ResizeHandle> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let x = x as i32;
+    let y = y as i32;
+    let w = w as i32;
+    let h = h as i32;
+    let points = [
+        (x, y, ResizeHandle::TopLeft),
+        (x + w / 2, y, ResizeHandle::Top),
+        (x + w - 1, y, ResizeHandle::TopRight),
+        (x + w - 1, y + h / 2, ResizeHandle::Right),
+        (x + w - 1, y + h - 1, ResizeHandle::BottomRight),
+        (x + w / 2, y + h - 1, ResizeHandle::Bottom),
+        (x, y + h - 1, ResizeHandle::BottomLeft),
+        (x, y + h / 2, ResizeHandle::Left),
+    ];
+    const R: i32 = 5; // 命中半径
+    for (px, py, id) in points {
+        if (cx - px).abs() <= R && (cy - py).abs() <= R {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn draw_handle(frame: &mut [u32], width: u32, height: u32, cx: i32, cy: i32, half: i32) {
+    let (w, h) = (width as i32, height as i32);
+    for yy in (cy - half)..=(cy + half) {
+        if yy < 0 || yy >= h {
+            continue;
+        }
+        for xx in (cx - half)..=(cx + half) {
+            if xx < 0 || xx >= w {
+                continue;
+            }
+            let idx = (yy as u32 * width + xx as u32) as usize;
+            frame[idx] = 0xFFFFFFFF;
+        }
+    }
 }
 
 fn mix_dim(src: u32) -> u32 {
