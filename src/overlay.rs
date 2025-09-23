@@ -17,6 +17,7 @@ pub struct OverlayState {
     pub screenshot: Option<(u32, u32, Vec<u8>)>, // 原始 RGBA 像素
     origin: (i32, i32),                          // 此截图对应显示器的原点（全局坐标）
     dim_cache: Option<Vec<u32>>,                 // 预计算的 BGRA+变暗 缓冲，提升重绘性能
+    bright_cache: Option<Vec<u32>>,              // 原始亮度 BGRA 缓冲（行拷贝加速选区恢复）
     drag_start: Option<(f64, f64)>,
     last_cursor: (f64, f64),
     pub selection: Option<(u32, u32, u32, u32)>, // 选区：x,y,w,h（相对窗口左上）
@@ -53,6 +54,7 @@ impl OverlayState {
             screenshot: None,
             origin: (0, 0),
             dim_cache: None,
+            bright_cache: None,
             drag_start: None,
             last_cursor: (0.0, 0.0),
             selection: None,
@@ -81,7 +83,7 @@ impl OverlayState {
         // 定位窗口，使其左上与显示器原点对齐
         self.window
             .set_outer_position(PhysicalPosition::new(origin.0, origin.1));
-        self.build_dim_cache();
+        self.build_caches();
         self.window.request_redraw();
         Ok(())
     }
@@ -92,6 +94,7 @@ impl OverlayState {
         self.selection = None;
         self.drag_start = None;
         self.dim_cache = None;
+        self.bright_cache = None;
     }
 
     pub fn handle_event(&mut self, event: &WindowEvent) -> OverlayAction {
@@ -352,24 +355,20 @@ impl OverlayState {
                                 | OverlayMode::MovingSelection
                                 | OverlayMode::Resizing
                         ) {
-                            if let Some((sw, sh, ref rgba)) = &self.screenshot {
+                            if let (Some((sw, sh, _)), Some(bright)) =
+                                (&self.screenshot, &self.bright_cache)
+                            {
                                 let copy_w = w.min(sw - x).min(width - x);
                                 let copy_h = h.min(sh - y).min(height - y);
                                 for row in 0..copy_h {
-                                    let src_row = (y + row) * sw;
+                                    let src_row = (y + row) * *sw;
                                     let dst_row = (y + row) * width;
-                                    let src_start = (src_row + x) as usize * 4;
-                                    let src_slice =
-                                        &rgba[src_start..src_start + (copy_w as usize) * 4];
-                                    for col in 0..copy_w {
-                                        let rgba_idx = (col as usize) * 4;
-                                        let r = src_slice[rgba_idx];
-                                        let g = src_slice[rgba_idx + 1];
-                                        let b = src_slice[rgba_idx + 2];
-                                        let a = src_slice[rgba_idx + 3];
-                                        frame[(dst_row + x + col) as usize] =
-                                            u32::from_le_bytes([b, g, r, a]);
-                                    }
+                                    let src_start = (src_row + x) as usize;
+                                    let dst_start = (dst_row + x) as usize;
+                                    let src_slice = &bright[src_start..src_start + copy_w as usize];
+                                    let dst_slice =
+                                        &mut frame[dst_start..dst_start + copy_w as usize];
+                                    dst_slice.copy_from_slice(src_slice);
                                 }
                             }
                         }
@@ -445,20 +444,25 @@ impl OverlayState {
         Some(png_data)
     }
 
-    fn build_dim_cache(&mut self) {
+    fn build_caches(&mut self) {
         if let Some((w, h, ref buf)) = self.screenshot {
-            let mut out: Vec<u32> = Vec::with_capacity((w * h) as usize);
+            let total = (w * h) as usize;
+            let mut dim: Vec<u32> = Vec::with_capacity(total);
+            let mut bright: Vec<u32> = Vec::with_capacity(total);
             for px in buf.chunks_exact(4) {
                 let r = px[0];
                 let g = px[1];
                 let b = px[2];
                 let a = px[3];
                 let packed = u32::from_le_bytes([b, g, r, a]);
-                out.push(mix_dim(packed));
+                bright.push(packed);
+                dim.push(mix_dim(packed));
             }
-            self.dim_cache = Some(out);
+            self.dim_cache = Some(dim);
+            self.bright_cache = Some(bright);
         } else {
             self.dim_cache = None;
+            self.bright_cache = None;
         }
     }
 }
