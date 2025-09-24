@@ -1,9 +1,3 @@
-mod capture;
-mod hotkey;
-mod overlay;
-mod renderer;
-mod window_manager;
-
 use anyhow::Result;
 use env_logger;
 use log::{error, info};
@@ -12,11 +6,11 @@ use winit::{
     event_loop::EventLoop,
 };
 
-use crate::capture::capture_fullscreen_raw_with_origin;
-use crate::hotkey::subscribe_f4;
-use crate::overlay::{OverlayAction, OverlayState};
-use crate::renderer::Renderer;
-use crate::window_manager::WindowState;
+use snip_rust::capture::capture_fullscreen_raw_with_origin;
+use snip_rust::hotkey::subscribe_f4;
+use snip_rust::overlay::{OverlayAction, OverlayState};
+use snip_rust::renderer::Renderer;
+use snip_rust::window_manager::WindowState;
 
 #[allow(deprecated)]
 fn main() -> Result<()> {
