@@ -82,8 +82,18 @@ pub fn compute_toolbar_rect(
     Some((bar_x, bar_y, total_w, total_h))
 }
 
-pub fn draw_toolbar(frame: &mut [u32], width: u32, height: u32, x: i32, y: i32, w: i32, h: i32) {
-    fill_rect(frame, width, height, x, y, w, h, 0xAA202020);
+pub fn draw_toolbar(
+    frame: &mut [u32],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    hovered: Option<usize>,
+) {
+    // 改为完全不透明背景，避免看到后方变暗像素导致“透视”感
+    fill_rect(frame, width, height, x, y, w, h, 0xFF202020);
     stroke_rect(frame, width, height, x, y, w, h, 0xFFFFFFFF);
     let mut cursor_x = x + TB_BTN_PAD_X;
     let center_y = y + h / 2;
@@ -92,10 +102,42 @@ pub fn draw_toolbar(frame: &mut [u32], width: u32, height: u32, x: i32, y: i32, 
         let bx = cursor_x;
         let by = center_y - TB_BTN_H / 2;
         draw_button(
-            frame, width, height, bx, by, TB_BTN_W, TB_BTN_H, idx, icon_color,
+            frame,
+            width,
+            height,
+            bx,
+            by,
+            TB_BTN_W,
+            TB_BTN_H,
+            idx,
+            icon_color,
+            hovered == Some(idx),
         );
         cursor_x += TB_BTN_W + TB_BTN_GAP;
     }
+}
+
+// 根据屏幕坐标命中哪个按钮（0..TB_BUTTONS-1）
+pub fn hit_test_toolbar_button(
+    px: i32,
+    py: i32,
+    bar_x: i32,
+    bar_y: i32,
+    bar_w: i32,
+    bar_h: i32,
+) -> Option<usize> {
+    if px < bar_x || py < bar_y || px >= bar_x + bar_w || py >= bar_y + bar_h {
+        return None;
+    }
+    // 按钮水平排布：从 bar_x + TB_BTN_PAD_X 开始
+    let mut cursor = bar_x + TB_BTN_PAD_X;
+    for idx in 0..TB_BUTTONS {
+        if px >= cursor && px < cursor + TB_BTN_W && py >= bar_y && py < bar_y + bar_h {
+            return Some(idx);
+        }
+        cursor += TB_BTN_W + TB_BTN_GAP;
+    }
+    None
 }
 
 fn draw_button(
@@ -107,20 +149,26 @@ fn draw_button(
     w: i32,
     h: i32,
     index: usize,
-    color: u32,
+    base_icon_color: u32,
+    hovered: bool,
 ) {
-    fill_rect(frame, width, height, x, y, w, h, 0x66333333);
-    stroke_rect(frame, width, height, x, y, w, h, 0xFFCCCCCC);
+    let (bg, border, icon_color) = if hovered {
+        (0xFF4A4A4A, 0xFFFFFFFF, 0xFFFFD24D)
+    } else {
+        (0xFF333333, 0xFFCCCCCC, base_icon_color)
+    };
+    fill_rect(frame, width, height, x, y, w, h, bg);
+    stroke_rect(frame, width, height, x, y, w, h, border);
     let icon_w = 12;
     let icon_h = 12;
     let ix = x + (w - icon_w) / 2;
     let iy = y + (h - icon_h) / 2;
     match index {
-        0 => icon_exit(frame, width, height, ix, iy, icon_w, icon_h, color),
-        1 => icon_pin(frame, width, height, ix, iy, icon_w, icon_h, color),
-        2 => icon_save(frame, width, height, ix, iy, icon_w, icon_h, color),
-        3 => icon_copy(frame, width, height, ix, iy, icon_w, icon_h, color),
-        4 => icon_annotate(frame, width, height, ix, iy, icon_w, icon_h, color),
+        0 => icon_exit(frame, width, height, ix, iy, icon_w, icon_h, icon_color),
+        1 => icon_pin(frame, width, height, ix, iy, icon_w, icon_h, icon_color),
+        2 => icon_save(frame, width, height, ix, iy, icon_w, icon_h, icon_color),
+        3 => icon_copy(frame, width, height, ix, iy, icon_w, icon_h, icon_color),
+        4 => icon_annotate(frame, width, height, ix, iy, icon_w, icon_h, icon_color),
         _ => {}
     }
 }

@@ -4,18 +4,28 @@ use std::num::NonZeroU32;
 use winit::{
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::ActiveEventLoop,
-    window::{Window, WindowAttributes},
+    window::{
+        CursorIcon::{self, *},
+        Window, WindowAttributes,
+    },
 };
 
 use crate::overlay::drawing::draw_handle;
 use crate::overlay::handles::{hit_test_handle, ResizeHandle};
-use crate::overlay::toolbar::{compute_toolbar_rect, draw_toolbar};
+use crate::overlay::toolbar::{compute_toolbar_rect, draw_toolbar, hit_test_toolbar_button};
 
 // OverlayAction: 外部事件结果（当前仍只返回 None；按钮交互未来扩展）
 pub enum OverlayAction {
     None,
     SelectionFinished(Vec<u8>),
     Canceled,
+    PasteSelection {
+        png: Vec<u8>,
+        width: u32,
+        height: u32,
+        screen_x: i32,
+        screen_y: i32,
+    },
 }
 
 // OverlayMode: 内部状态机
@@ -45,6 +55,8 @@ pub struct OverlayState {
     move_offset: Option<(i32, i32)>,
     mode: OverlayMode,
     resize_handle: Option<ResizeHandle>,
+    toolbar_rect: Option<(i32, i32, i32, i32)>, // 缓存当前工具栏矩形（屏幕内坐标）
+    toolbar_hover: Option<usize>,               // 当前悬停按钮
 }
 
 impl OverlayState {
@@ -82,6 +94,8 @@ impl OverlayState {
             move_offset: None,
             mode: OverlayMode::Idle,
             resize_handle: None,
+            toolbar_rect: None,
+            toolbar_hover: None,
         })
     }
 
@@ -119,6 +133,7 @@ impl OverlayState {
         if !self.visible {
             return OverlayAction::None;
         }
+        let mut immediate_action = OverlayAction::None;
         match event {
             WindowEvent::MouseInput {
                 state,
@@ -153,25 +168,37 @@ impl OverlayState {
                     | OverlayMode::Resizing
                     | OverlayMode::Annotating => {}
                 },
-                ElementState::Released => match self.mode {
-                    OverlayMode::Dragging => {
-                        self.drag_start = None;
-                        if self.selection.is_some() {
-                            self.mode = OverlayMode::IdleWithSelection;
-                        } else {
-                            self.mode = OverlayMode::Idle;
+                ElementState::Released => {
+                    // 工具栏点击优先
+                    if matches!(self.mode, OverlayMode::IdleWithSelection) {
+                        if let Some((bx, by, bw, bh)) = self.toolbar_rect {
+                            let cx = self.last_cursor.0 as i32;
+                            let cy = self.last_cursor.1 as i32;
+                            if let Some(btn) = hit_test_toolbar_button(cx, cy, bx, by, bw, bh) {
+                                immediate_action = self.execute_toolbar_button(btn);
+                            }
                         }
                     }
-                    OverlayMode::MovingSelection => {
-                        self.move_offset = None;
-                        self.mode = OverlayMode::IdleWithSelection;
+                    match self.mode {
+                        OverlayMode::Dragging => {
+                            self.drag_start = None;
+                            if self.selection.is_some() {
+                                self.mode = OverlayMode::IdleWithSelection;
+                            } else {
+                                self.mode = OverlayMode::Idle;
+                            }
+                        }
+                        OverlayMode::MovingSelection => {
+                            self.move_offset = None;
+                            self.mode = OverlayMode::IdleWithSelection;
+                        }
+                        OverlayMode::Resizing => {
+                            self.resize_handle = None;
+                            self.mode = OverlayMode::IdleWithSelection;
+                        }
+                        _ => {}
                     }
-                    OverlayMode::Resizing => {
-                        self.resize_handle = None;
-                        self.mode = OverlayMode::IdleWithSelection;
-                    }
-                    _ => {}
-                },
+                }
             },
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = (position.x, position.y);
@@ -290,23 +317,46 @@ impl OverlayState {
                     OverlayMode::IdleWithSelection => {
                         if let Some((x, y, w, h)) = self.selection {
                             let (cx, cy) = (position.x as i32, position.y as i32);
-                            if let Some(handle) = hit_test_handle(cx, cy, x, y, w, h) {
-                                use winit::window::CursorIcon::*;
-                                let icon = match handle {
-                                    ResizeHandle::Top | ResizeHandle::Bottom => NsResize,
-                                    ResizeHandle::Left | ResizeHandle::Right => EwResize,
-                                    ResizeHandle::TopLeft | ResizeHandle::BottomRight => NwseResize,
-                                    ResizeHandle::TopRight | ResizeHandle::BottomLeft => NeswResize,
-                                };
-                                self.window.set_cursor(icon);
-                            } else if cx >= x as i32
-                                && cy >= y as i32
-                                && cx < (x + w) as i32
-                                && cy < (y + h) as i32
-                            {
-                                self.window.set_cursor(winit::window::CursorIcon::Move);
+                            // 1. 工具栏 hover 检测（若命中则直接使用 Pointer，不再继续后续手柄/区域判定）
+                            let mut over_toolbar = false;
+                            if let Some((bx, by, bw, bh)) = self.toolbar_rect {
+                                if let Some(btn) = hit_test_toolbar_button(cx, cy, bx, by, bw, bh) {
+                                    self.toolbar_hover = Some(btn);
+                                    self.window.set_cursor(CursorIcon::Pointer);
+                                    over_toolbar = true;
+                                } else {
+                                    self.toolbar_hover = None;
+                                }
                             } else {
-                                self.window.set_cursor(winit::window::CursorIcon::Default);
+                                self.toolbar_hover = None;
+                            }
+
+                            if !over_toolbar {
+                                // 2. 手柄与选区区域判定
+                                if let Some(handle) = hit_test_handle(cx, cy, x, y, w, h) {
+                                    let icon = match handle {
+                                        ResizeHandle::Top | ResizeHandle::Bottom => NsResize,
+                                        ResizeHandle::Left | ResizeHandle::Right => EwResize,
+                                        ResizeHandle::TopLeft | ResizeHandle::BottomRight => {
+                                            NwseResize
+                                        }
+                                        ResizeHandle::TopRight | ResizeHandle::BottomLeft => {
+                                            NeswResize
+                                        }
+                                    };
+                                    self.window.set_cursor(icon);
+                                } else if cx >= x as i32
+                                    && cy >= y as i32
+                                    && cx < (x + w) as i32
+                                    && cy < (y + h) as i32
+                                {
+                                    self.window.set_cursor(CursorIcon::Move);
+                                } else {
+                                    if self.toolbar_hover.is_none() {
+                                        self.window.set_cursor(CursorIcon::Default);
+                                    }
+                                    // 已被 toolbar hover 设置，不处理
+                                }
                             }
                         }
                     }
@@ -315,7 +365,8 @@ impl OverlayState {
             }
             _ => {}
         }
-        OverlayAction::None
+        // 返回可能的按钮动作（若未触发仍为 None）
+        immediate_action
     }
 
     pub fn redraw(&mut self) {
@@ -401,11 +452,21 @@ impl OverlayState {
                             draw_handle(&mut frame, width, height, cx, cy, hs2);
                         }
                         if matches!(self.mode, OverlayMode::IdleWithSelection) {
-                            if let Some((bar_x, bar_y, bar_w, bar_h)) =
-                                compute_toolbar_rect(x, y, w, h, sw, sh)
-                            {
-                                draw_toolbar(&mut frame, width, height, bar_x, bar_y, bar_w, bar_h);
+                            self.toolbar_rect = compute_toolbar_rect(x, y, w, h, sw, sh);
+                            if let Some((bar_x, bar_y, bar_w, bar_h)) = self.toolbar_rect {
+                                draw_toolbar(
+                                    &mut frame,
+                                    width,
+                                    height,
+                                    bar_x,
+                                    bar_y,
+                                    bar_w,
+                                    bar_h,
+                                    self.toolbar_hover,
+                                );
                             }
+                        } else {
+                            self.toolbar_rect = None;
                         }
                     }
                 }
@@ -468,6 +529,70 @@ impl OverlayState {
             self.bright_cache = None;
         }
     }
+}
+
+impl OverlayState {
+    fn execute_toolbar_button(&mut self, index: usize) -> OverlayAction {
+        match index {
+            0 => {
+                // Exit
+                self.hide();
+                OverlayAction::Canceled
+            }
+            1 => {
+                // Pin -> 生成贴图窗口，携带屏幕绝对坐标
+                if let Some(png) = self.take_selection_png() {
+                    if let Some((sx, sy, w, h)) = self.selection {
+                        let screen_x = self.origin.0 + sx as i32;
+                        let screen_y = self.origin.1 + sy as i32;
+                        self.hide();
+                        return OverlayAction::PasteSelection {
+                            png,
+                            width: w,
+                            height: h,
+                            screen_x,
+                            screen_y,
+                        };
+                    }
+                    self.hide();
+                    OverlayAction::SelectionFinished(png)
+                } else {
+                    OverlayAction::None
+                }
+            }
+            2 => {
+                // Save to file (简单写入当前工作目录 snip_YYYYMMDD_HHMMSS.png)
+                if let Some(png) = self.take_selection_png() {
+                    if let Err(e) = save_png_auto(&png) {
+                        eprintln!("save failed: {e}");
+                    }
+                }
+                OverlayAction::None
+            }
+            3 => {
+                // Copy (占位：暂未实现剪贴板集成)
+                // TODO: 后续可引入 arboard / copypasta 以支持 RGBA + PNG
+                OverlayAction::None
+            }
+            4 => {
+                // Annotate 模式切换
+                self.mode = OverlayMode::Annotating; // 目前仅状态标记
+                OverlayAction::None
+            }
+            _ => OverlayAction::None,
+        }
+    }
+}
+
+fn save_png_auto(data: &[u8]) -> Result<()> {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = format!("snip_{ts}.png");
+    fs::write(&path, data).map_err(|e| anyhow!("write png: {e}"))
 }
 
 fn mix_dim(src: u32) -> u32 {
