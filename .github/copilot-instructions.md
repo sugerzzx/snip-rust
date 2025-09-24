@@ -1,71 +1,116 @@
 # Copilot Instructions for `snip_rust`
 
-These instructions help AI coding agents work effectively in this repository. Focus on the concrete patterns that already exist; do not invent large new abstractions unless explicitly requested.
+These guidelines describe the CURRENT reality of the repository. Do not assume features that are only mentioned in older history or prior README versions.
 
 ## Project Overview
-- Goal: Cross‑platform screenshot (snipping) utility written in Rust. Current implemented core: fullscreen + rectangular area capture producing PNG bytes.
-- Status: Early scaffolding. Many modules listed in `README.md` (renderer, window_manager, tray, settings, paste) are not yet present in `src/`; only `capture.rs`, `hotkey.rs`, `main.rs`, and example code are implemented.
-- Primary external crates actually in use so far: `screenshots`, `image` (encoder only), `anyhow`, `env_logger`.
+- Goal: Lightweight cross‑platform screenshot (snipping) utility (prototype stage).
+- Current pipeline: global hotkey (F4) → fullscreen capture (single screen) → overlay dim layer + mouse drag selection → crop → optional Pin → multiple paste windows.
+- Rendering is pure CPU (no GPU): `screenshots` capture + `tiny-skia` canvas + `softbuffer` present.
 
-## Source Layout (Current Reality)
-- `src/main.rs`: Initializes logging only. Keep `main` minimal; add orchestration logic here gradually.
-- `src/capture.rs`: Core screenshot logic. Converts raw RGBA (optionally BGRA) into PNG bytes. Contains pure helpers and runtime tests.
-- `src/hotkey.rs`: Stub for future global hotkey management (uses `anyhow::Result`).
-- `examples/capture_demo.rs`: Example binary demonstrating saving fullscreen and area captures.
+## Source Layout (Actual Files)
+- `src/main.rs`: Event loop, overlay orchestration, tray icon (Quit), paste window management.
+- `src/capture.rs`: Capture APIs (`fullscreen`, `raw`, `with_origin`, `area`).
+- `src/renderer.rs`: Pixmap holder for future annotation pipeline.
+- `src/paste_window.rs`: Pinned windows (pre-rendered dual border buffer, draggable, always-on-top).
+- `src/hotkey.rs`: Global F4 registration + channel subscription.
+- `src/overlay/`: Selection overlay modules (state, toolbar, handles, drawing) with dim cache.
+- `build.rs`: Multi-size ICO (16..256) generation from `assets/app_icon.png` via `ico` + embedding with `winres`.
+- `assets/app_icon.png`: Source PNG icon.
+- `examples/capture_demo.rs`: Minimal capture example.
+- `lib.rs`: Re-exports.
 
-## Capture Module Patterns
-- Public API surface: `capture_fullscreen() -> Result<Vec<u8>>`, `capture_area(Rect) -> Result<Vec<u8>>` returning PNG-encoded bytes (not raw pixels). Preserve this contract unless a deliberate API change is approved.
-- Color channel handling: By default treat buffer as RGBA. If env var `SNIP_FORCE_BGRA` is set (any value), convert BGRA→RGBA via `bgra_to_rgba`. Do NOT auto-detect format in other ways.
-- PNG encoding: Centralized in `encode_png`; if adding formats, add new helper (e.g. `encode_jpeg`) rather than branching `encode_png` heavily.
-- Cropping logic in `capture_area`: Computes relative coordinates against the screen origin; uses safe saturation and bounds clamping. When modifying, keep memory layout assumptions (4 bytes per pixel, row-major) explicit.
+## Key Public / Semi-Public APIs
+- Capture:
+	- `capture_fullscreen() -> Result<Vec<u8>>`
+	- `capture_fullscreen_raw() -> Result<(u32,u32,Vec<u8>)>`
+	- `capture_fullscreen_raw_with_origin() -> Result<(i32,i32,u32,u32,Vec<u8>)>`
+	- `capture_area(Rect) -> Result<Vec<u8>>`
+- Renderer:
+	- `Renderer::new(w,h)` / `load_png_bytes(&[u8])` / `as_bgra_u32()`
+- Overlay:
+	- `OverlayState::show_with_image(w,h,pixels, origin)`
+	- `handle_event(&WindowEvent) -> OverlayAction`
+	- `OverlayAction::{None, Canceled, SelectionFinished(Vec<u8>), PasteSelection { png, width, height, screen_x, screen_y }}`
+- Paste:
+	- `PasteWindow::new_from_png(event_loop, png_bytes, Some((screen_x, screen_y)))`
+
+## Patterns & Conventions
+- Lifetimes: Softbuffer surfaces require `'static`; current interim solution uses `Box::leak`. Do not refactor away unless replacing with a safe owner pattern across the event loop.
+- Color channels: Internal processing keeps RGBA. Presentation to softbuffer expects BGRA ordering packed in `u32`. Conversion is explicit (`renderer.as_bgra_u32`). Do not silently reorder outside these helpers.
+- Dim background: Overlay precomputes `dim_cache` once per capture; bright selection region uses original buffer.
+- Paste windows: Pre-render focused/unfocused frame buffers (constant-time redraw during drag).
+- Event loop: Using deprecated `EventLoop::run` (winit 0.30) intentionally. Do not migrate to `run_app` unless we re-architect handler pattern.
+- Selection logic: Only update/redraw on cursor moved while dragging. Keep overlay responsive by minimizing allocations in that path.
+
+## Capture Module Guidelines
+- Add new capture outputs as separate functions; do NOT change existing return signatures without explicit approval.
+- If introducing multi-monitor stitched capture, create new API (e.g., `capture_virtual_desktop_raw`) rather than mutating current single-screen semantics.
+- BGRA conversion only triggered by `SNIP_FORCE_BGRA`. Do not add heuristic detection.
 
 ## Error Handling
-- Use `anyhow::{Result, anyhow!}` for fallible operations. Provide contextual messages mirroring existing style: lower-case start, concise (`"capture failed: {e}"`). Do not introduce `thiserror` unless broad consensus.
+- Use `anyhow::{Result, anyhow!}` with concise, lower-case contextual messages. No `thiserror` unless a broad error taxonomy becomes necessary.
 
-## Testing Conventions
-- Unit tests colocated in the same file under `#[cfg(test)]` with small, fast checks. Runtime-dependent tests (like `test_fullscreen_runtime_capture`) presently perform a real capture; keep them lightweight and guarded only if they become flaky (consider env gate later, e.g. `SNIP_SKIP_RUNTIME_TEST`).
+## Logging
+- Initialize via `env_logger::init()` in `main` (already present). Use `debug!` for verbose pixel/math details only if diagnosing; keep default code quiet.
 
-## Logging & Diagnostics
-- `env_logger::init()` is called in `main`. Prefer `log::{debug,info,warn,error}` macros in new code. Avoid printing via `println!` outside example binaries.
+## Testing
+- Colocate fast unit tests (see `capture.rs`). Avoid fragile GUI-dependent tests. If adding scenario tests that require a display, consider gating with env var (future: `SNIP_SKIP_RUNTIME_TEST`).
 
-## Adding New Functionality
-- Future modules (renderer, window_manager, tray, settings, paste) listed in README are placeholders. Create files only when implementing actual logic; update README to reflect reality if architectural direction changes.
-- For global hotkeys: extend `HotkeyManager` methods rather than creating free functions. Keep a thin abstraction that can later wrap platform-specific backends.
-- For image post-processing or annotations: return raw RGBA buffers internally, only encoding at final boundary (reuse or extend `encode_png`).
+## Adding Functionality (Scoped Guidance)
+- Hotkeys: Extend existing `subscribe_*` pattern returning a channel; keep registration centralized (avoid multiple managers/thread leaks).
+- Overlay Enhancements: Add new visual effects (mask, interior highlight) by layering additional write passes in `redraw`; reuse cached buffers when possible.
+- Annotations / Editing: Prefer operating on raw RGBA within `renderer.rs` or a new `annotate` module, only encoding to PNG at external boundaries.
+- Avoid adding GUI frameworks (egui/wgpu/iced) unless the maintainer explicitly requests a UI layer.
 
-## Example Usage Pattern
+## Example (Selection + Pin Flow)
 ```rust
-use capture::{capture_area, Rect};
-let png_bytes = capture_area(Rect { x: 0, y: 0, width: 200, height: 150 })?;
-// persist or send over channel
+let (ox, oy, w, h, rgba) = capture_fullscreen_raw_with_origin()?;
+overlay.show_with_image(w, h, rgba, (ox, oy))?;
+match overlay.handle_event(&event) {
+	OverlayAction::PasteSelection { png, screen_x, screen_y, .. } => {
+		PasteWindow::new_from_png(&event_loop, &png, Some((screen_x, screen_y)))?;
+	}
+	_ => {}
+}
 ```
 
 ## Build & Run
-- Standard build: `cargo build` / `cargo run`.
-- Release build: `cargo build --release`.
-- Example: run capture demo (ensure module path / example structure): `cargo run --bin capture_demo` if promoted to `examples/` binary, otherwise integrate via a proper `[[bin]]` entry. Currently the file lives under `src/examples/`; to expose it as a cargo example, move it to top-level `examples/`.
-- Logging: `RUST_LOG=debug cargo run` (Windows cmd: `set RUST_LOG=debug && cargo run`).
+- Dev: `cargo run` (console visible, logs)
+- Release: `cargo build --release` (no console window, embedded icon)
+- Example: `cargo run --example capture_demo`
+- Debug logging (Windows CMD): `set RUST_LOG=debug && cargo run`
 
-## Platform Considerations
-- Screen detection uses first screen containing the provided point (`Screen::from_point`). Multi-monitor cropping relies on coordinate translation via `display_info.x/y`. Preserve this approach; if expanding to multi-screen composites, add a new API instead of mutating existing semantics.
-- Environment toggle `SNIP_FORCE_BGRA` is the only supported format switch; document any new env flags here when added.
+## Environment Variables
+- `SNIP_FORCE_BGRA`: Forces BGRA→RGBA conversion on captured buffer (diagnostics / platform quirks).
 
-## Style & Conventions
-- Keep functions small and single-purpose (see `encode_png`, `maybe_convert_bgra`).
-- Avoid premature async abstractions; remain synchronous until a clear blocking need (e.g. heavy IO) emerges.
-- Prefer explicit allocation sizing (`Vec::with_capacity`) where predictable.
-- Public structs use `#[derive(Debug, Clone, Copy)]` when value-semantic (e.g., `Rect`).
+## Style Guidelines
+- Functions stay small & focused. Keep pixel math explicit (index derivations, row-major assumptions).
+- Pre-size buffers via `Vec::with_capacity` where size is known.
+- Avoid allocation inside high-frequency redraw loops; precompute caches.
+- Public value types (e.g., `Rect`) derive `Debug, Clone, Copy`.
 
-## PR / Change Guidance for Agents
-1. Confirm no divergence between README planned modules and actual files before referencing them.
-2. When introducing a new module, add a succinct comment header mirroring existing file comments (purpose summary in Chinese is acceptable—match repo bilingual style).
-3. Maintain backward compatibility of existing public functions unless user explicitly asks for breaking change.
-4. Keep instruction file (`.github/copilot-instructions.md`) updated when adding env vars, new public APIs, or altering capture pipeline.
+## PR / Change Guidance (For Agents)
+1. Verify README + instructions reflect actual files before referencing a module.
+2. When adding new public API (function, env var), update BOTH README and this file.
+3. Keep overlay interaction contract stable (`OverlayAction`) unless explicitly asked to change UX.
+4. Do not remove `capture_fullscreen()` even if unused—external code may rely on it in future.
+5. If optimizing performance, measure (log at debug) before altering algorithms.
 
-## Out-of-Scope for Autonomous Changes
-- Implementing full UI, tray, or hotkey backend without explicit request.
-- Reorganizing crate into workspace or multi-crate layout.
-- Adding heavy dependencies (e.g. GPU frameworks) without approval.
+## Out-of-Scope (Without Explicit Request)
+- Async runtime introduction
+- GPU backend migration
+- Full annotation suite beyond initial primitives (pending request)
+- Settings persistence / advanced configuration UI
+- Multi-monitor mosaic capture (will be added as new API variant)
+
+## Future Roadmap (Do Not Preempt)
+- Esc / right-click cancel in overlay
+- Multi-monitor (current screen / stitched virtual desktop)
+- Clipboard copy (PNG + RGBA)
+- Annotation primitives (rectangle, arrow, text)
+- Replace `Box::leak` with managed lifetime container
+- Tray additions: quick capture, theme toggle
+- Dark/Light icon variants
 
 ---
-If anything here seems incomplete (e.g., you want conventions for future renderer code), ask the maintainer before extrapolating.
+If something is ambiguous, ask rather than guessing. Keep changes incremental and observable.

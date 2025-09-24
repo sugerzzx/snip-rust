@@ -1,25 +1,30 @@
 # Snip Rust - 轻量截图 / 选区工具 (实验阶段)
 
-基于纯 CPU 渲染与系统截图 API：`winit` + `softbuffer` + `tiny-skia` + `screenshots`。当前目标：验证核心截图、选区、显示管线与热键触发流程。
+基于纯 CPU 渲染与系统截图 API：`winit` + `softbuffer` + `tiny-skia` + `screenshots`。当前目标：验证核心截图、选区、钉住窗口 (Pin) 管线与热键触发流程。
 
-> 状态：早期原型（prototype）。不存在 UI 框架集成 / 托盘 / 配置持久化。README 已剔除尚未落地的模块描述，后续实现再补。
+> 状态：早期原型（prototype）。已加入：
+>
+> - Overlay 选区 + 多粘贴窗口 (Pin)
+> - 系统托盘（退出菜单）
+> - 可执行文件嵌入多尺寸应用图标 (build.rs 生成 ICO)
+>   仍缺少：配置持久化 / 剪贴板 / 标注层 / 多显示器拼接。
 
 ## 当前源码结构 (实际存在的文件)
 
 ```
 src/
-	main.rs             # 事件循环 + 状态机 (普通模式 / Overlay 选区模式)
+	main.rs             # 事件循环：F4 截图 -> Overlay -> Pin 生成多个粘贴窗口 + 托盘
 	capture.rs          # 全屏 & 区域截图 / 原始 RGBA & PNG 编码
-	renderer.rs         # tiny-skia Pixmap 管理 + PNG 解码到画布
-	window_manager.rs   # 主窗口 + softbuffer surface 封装
+	renderer.rs         # tiny-skia Pixmap 管理 (后续标注用)
+	paste_window.rs     # 钉住(粘贴)窗口：预渲染边框/多实例/拖动
 	hotkey.rs           # F4 全局热键订阅（global-hotkey）
-	overlay.rs          # 选区覆盖层：变暗背景 + 拖拽矩形 + 裁剪
+	overlay/            # Overlay 子模块 (state / toolbar / handles / drawing)
+build.rs              # 构建期生成多尺寸 ICO 并嵌入 exe 资源
+assets/app_icon.png   # 源 PNG（构建时生成 16~256 多尺寸 ICO）
 lib.rs                # 模块 re-export
 examples/
 	capture_demo.rs     # 简单截图示例（保存文件）
 ```
-
-（README 旧版提到的 `paste.rs / tray.rs / settings.rs` 尚未实现，后续实现后再加入）
 
 ## 已实现功能
 
@@ -32,6 +37,9 @@ examples/
 - Softbuffer 提交前自动 resize，避免 panic
 - 简单 BGRA <-> 显示转换（`renderer.as_bgra_u32()`）
 - 变暗背景预计算缓存（提升拖拽时流畅度）
+- 系统托盘：图标 + 退出菜单项（tray-icon）
+- 可执行文件图标：多尺寸 ICO 内嵌（16/24/32/48/64/128/256）
+- Paste 窗口预渲染边框缓冲，加速拖动（不再每帧重绘阴影）
 
 ## 使用方法
 
@@ -43,10 +51,15 @@ cargo run
 
 步骤：
 
-1. 启动后主窗口空白（等待操作）
-2. 按下 F4 进入截图选区模式（主窗口隐藏）
-3. 拖拽左键绘制区域
-4. 松开：选中区域显示在主窗口
+1. 启动后无主预览窗口（常驻后台监听 F4）
+2. 按下 F4 进入截图选区 Overlay 模式
+3. 拖拽左键绘制区域（可调整 / 移动 / 工具栏）
+4. 点击工具栏“钉住”(Pin)：生成一个独立粘贴窗口（支持多实例）
+5. 粘贴窗口 (Pin)：
+   - 无边框 / 置顶 / 可左键拖动移动
+   - 预渲染双层边框：聚焦亮蓝 / 失焦灰色
+   - 多窗口并存，可各自关闭
+   - 右键 / Esc（未来计划）关闭；当前右键已隐藏窗口（关闭逻辑后续统一）
 
 ## 依赖概览
 
@@ -60,6 +73,8 @@ cargo run
 | global-hotkey             | 注册 F4 全局热键                                         |
 | anyhow / log / env_logger | 错误与日志                                               |
 | bytemuck                  | 像素切片转换辅助                                         |
+| tray-icon                 | 系统托盘菜单与图标                                       |
+| winres / ico (build)      | 构建期生成多尺寸 ICO 并嵌入                              |
 
 ## 环境变量
 
@@ -96,14 +111,32 @@ set RUST_LOG=debug && cargo run
 | 稳定性     | 移除 `Box::leak`，改用自管理生命周期结构        |
 | 多显示器   | 目前只抓 `from_point(0,0)` 的一个屏幕；未做拼接 |
 | DPI / 缩放 | 未处理 HiDPI 比例差异（逻辑像素 vs 物理像素）   |
-| 取消操作   | Esc / 右键取消选区尚未实现                      |
+| 取消操作   | Esc / 右键取消选区尚未实现（计划）              |
 | 选区高亮   | 仅边框；尚未填充半透明/反向遮罩效果             |
 | 热键扩展   | 仅 F4，尚未添加自定义注册机制                   |
 | 剪贴板     | 尚未复制 PNG / 原始像素到系统剪贴板             |
 | 注释工具   | 计划：矩形/箭头/文本/马赛克 等                  |
-| Paste 窗口 | 尚未实现贴图悬浮窗口（多实例）                  |
-| 托盘       | 无托盘菜单；退出仅靠关闭主窗口                  |
+| Paste 窗口 | 已实现多实例/拖动/预渲染边框；缺关闭回收逻辑    |
+| 托盘       | 已有退出菜单；待添加“立即截图/设置/主题”        |
+| 图标缓存   | Windows 可能缓存旧图标；需清除 Explorer 缓存    |
 | 配置       | 缺少用户配置/持久化（JSON/ron）                 |
+
+## 图标缓存刷新（Windows）
+
+若替换 `assets/app_icon.png` 后图标仍旧：
+
+```cmd
+taskkill /f /im explorer.exe
+del /q %LOCALAPPDATA%\IconCache.db
+del /q %LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache_*.db
+start explorer.exe
+```
+
+然后重新构建：
+
+```cmd
+cargo build --release
+```
 
 ## 典型调用示例
 
@@ -123,12 +156,15 @@ let (ox, oy, w, h, rgba) = capture_fullscreen_raw_with_origin()?;
 
 ## Roadmap（短期）
 
-1. Esc 取消 / 右键取消
-2. 多显示器：当前光标所在屏幕 / 全拼接模式二选一接口
-3. 剪贴板复制（PNG + 原始像素）
-4. 注释层（矩形 + 文本）初版
-5. 去除 `Box::leak` 替换为持久 Owner 容器
-6. 性能采样（大 4K 屏 / 多屏拖拽）
+1. Esc / 右键取消选区
+2. 多显示器支持（当前屏 / 全拼接）
+3. 剪贴板复制（PNG + RGBA）
+4. 注释层（矩形 / 文本）
+5. 去除 `Box::leak` 改为安全所有权容器
+6. Paste 窗口清理 / 关闭一致性
+7. 性能采样（4K / 多屏拖拽）
+8. 托盘：添加“立即截图 / 设置”
+9. 主题适配（深/浅色托盘图标）
 
 ## 调试日志
 
