@@ -1,6 +1,12 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 use anyhow::Result;
 use env_logger;
+use image::ImageReader;
 use log::info;
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem},
+    Icon, TrayIconBuilder,
+};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::EventLoop,
@@ -15,13 +21,43 @@ use snip_rust::paste_window::PasteWindow;
 #[allow(deprecated)]
 fn main() -> Result<()> {
     env_logger::init();
-    info!("starting snip_rust (overlay + paste mode)");
+    info!("starting snip_rust (overlay + paste mode + tray)");
     let event_loop = EventLoop::new()?;
+
+    // 从嵌入的 PNG 构建托盘图标（assets/app_icon.png）
+    fn build_tray_icon() -> Icon {
+        const BYTES: &[u8] = include_bytes!("../assets/app_icon.png");
+        let reader = ImageReader::new(std::io::Cursor::new(BYTES))
+            .with_guessed_format()
+            .unwrap();
+        let img = reader.decode().expect("decode icon").to_rgba8();
+        let (w, h) = img.dimensions();
+        Icon::from_rgba(img.into_raw(), w, h).expect("icon rgba")
+    }
+
+    // 托盘菜单（仅退出）
+    let tray_menu = Menu::new();
+    let quit_item = MenuItem::new("退出(&Q)", true, None);
+    tray_menu.append(&quit_item).ok();
+    let _tray = TrayIconBuilder::new()
+        .with_tooltip("Snip Rust")
+        .with_icon(build_tray_icon())
+        .with_menu(Box::new(tray_menu))
+        .build()
+        .ok();
+    let menu_event_rx = MenuEvent::receiver();
     let mut paste_windows: Vec<PasteWindow> = Vec::new(); // 多 PasteWindow
     let mut hotkey_rx = subscribe_f4().ok();
     let mut overlay: Option<OverlayState> = None;
     let _ = event_loop.run(|event, elwt| match event {
         Event::AboutToWait => {
+            // 菜单事件处理（退出）
+            while let Ok(ev) = menu_event_rx.try_recv() {
+                if ev.id == quit_item.id() {
+                    elwt.exit();
+                    return; // 直接退出
+                }
+            }
             // 轮询热键事件：进入 overlay 选区模式
             if let Some(rx) = &mut hotkey_rx {
                 while let Ok(()) = rx.try_recv() {
