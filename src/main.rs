@@ -143,7 +143,6 @@ fn main() -> Result<()> {
             if let Some(ov) = &mut overlay {
                 if window_id == ov.window.id() {
                     match ov.handle_event(&event) {
-                        OverlayAction::SelectionFinished(_png) => { /* 废弃预览逻辑 */ }
                         OverlayAction::Canceled => { /* overlay 已隐藏 不做处理 */ }
                         OverlayAction::PasteSelection {
                             png,

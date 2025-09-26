@@ -2,8 +2,9 @@ use anyhow::{anyhow, Result};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use winit::{
-    event::{ElementState, MouseButton, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::ActiveEventLoop,
+    keyboard::{KeyCode, PhysicalKey},
     window::{
         CursorIcon::{self, *},
         Window, WindowAttributes,
@@ -17,7 +18,6 @@ use crate::overlay::toolbar::{compute_toolbar_rect, draw_toolbar, hit_test_toolb
 // OverlayAction: 外部事件结果（当前仍只返回 None；按钮交互未来扩展）
 pub enum OverlayAction {
     None,
-    SelectionFinished(Vec<u8>),
     Canceled,
     PasteSelection {
         png: Vec<u8>,
@@ -363,6 +363,17 @@ impl OverlayState {
                     _ => {}
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                self.hide();
+            }
             _ => {}
         }
         // 返回可能的按钮动作（若未触发仍为 None）
@@ -555,10 +566,8 @@ impl OverlayState {
                         };
                     }
                     self.hide();
-                    OverlayAction::SelectionFinished(png)
-                } else {
-                    OverlayAction::None
                 }
+                OverlayAction::None
             }
             2 => {
                 // Save to file (简单写入当前工作目录 snip_YYYYMMDD_HHMMSS.png)
