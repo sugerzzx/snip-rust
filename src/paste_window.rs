@@ -166,6 +166,15 @@ impl PasteWindow {
         if window_id != self.window.id() {
             return;
         }
+
+        let actual_size = self.window.inner_size();
+        if actual_size.width != self.total_w || actual_size.height != self.total_h {
+            // 尺寸不符则调整
+            let _ = self
+                .window
+                .request_inner_size(PhysicalSize::new(self.total_w, self.total_h));
+        }
+
         if let Ok(mut buf) = self.surface.buffer_mut() {
             let src = if self.focused {
                 &self.frame_focus
