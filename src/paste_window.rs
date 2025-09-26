@@ -6,6 +6,7 @@ use winit::{
     event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::ActiveEventLoop,
     keyboard::{KeyCode, PhysicalKey},
+    platform::windows::WindowAttributesExtWindows,
     window::{Window, WindowAttributes, WindowLevel},
 };
 
@@ -63,8 +64,8 @@ impl PasteWindow {
             .with_resizable(false)
             .with_visible(true)
             .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_inner_size(PhysicalSize::new(total_w, total_h));
-        // .with_skip_taskbar(true);
+            .with_inner_size(PhysicalSize::new(total_w, total_h))
+            .with_skip_taskbar(true);
         let win = active.create_window(attrs)?;
         if let Some((x, y)) = desired_pos {
             // 目标位置应与选区左上对齐，窗口包含 margin 需向左上偏移 margin
