@@ -5,6 +5,7 @@ use winit::{
     event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::ActiveEventLoop,
     keyboard::{KeyCode, PhysicalKey},
+    platform::windows::WindowAttributesExtWindows,
     window::{
         CursorIcon::{self, *},
         Window, WindowAttributes,
@@ -73,7 +74,8 @@ impl OverlayState {
             .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
             .with_visible(false)
             .with_title("Snip Overlay")
-            .with_inner_size(size); // 物理像素避免 DPI 放大二次缩放
+            .with_inner_size(size) // 物理像素避免 DPI 放大二次缩放
+            .with_skip_taskbar(true);
         let window = active.create_window(attrs)?;
         let window: &'static Window = Box::leak(Box::new(window));
         let context = Context::new(window).map_err(|e| anyhow!("overlay ctx: {e}"))?;
