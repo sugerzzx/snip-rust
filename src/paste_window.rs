@@ -10,11 +10,24 @@ use winit::{
     window::{Window, WindowAttributes, WindowLevel},
 };
 
+// muda 右键上下文菜单（复制图像 / 销毁）
+use muda::{ContextMenu, Menu, MenuId, MenuItem as CtxMenuItem, PredefinedMenuItem};
+
 // PasteWindow: 钉住的图片窗口（无边框 / 可拖动 / 置顶 / 预渲染边框提升性能）
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ClickGuard {
+    // 正常状态：左键按下可进入拖动
+    Idle,
+    // 下一个左键 Press 仅用于关闭刚弹出的菜单，不触发拖动，消费后回到 Idle
+    SkipNext,
+}
+
 pub struct PasteWindow {
+    // 原始 Window Box 指针；通过 into_raw 获取，用于最终回收
+    raw_window: *mut Window,
     pub window: &'static Window,
-    surface: Surface<&'static Window, &'static Window>,
-    _context: Context<&'static Window>,
+    surface: Option<Surface<&'static Window, &'static Window>>,
+    _context: Option<Context<&'static Window>>,
     pub width: u32,  // 原始图像宽
     pub height: u32, // 原始图像高
     #[allow(dead_code)]
@@ -34,6 +47,14 @@ pub struct PasteWindow {
     frame_unfocus: Vec<u32>,
     // 上一次窗口内光标位置（用于确定 press 时的拖动 offset）
     last_local_cursor: (f64, f64),
+    // 上下文菜单及其条目 ID
+    ctx_menu: Menu,
+    // 菜单关闭后的单次左键防拖动守卫
+    click_guard: ClickGuard,
+    pub ctx_copy_id: MenuId,
+    pub ctx_destroy_id: MenuId,
+    // 标记：等待销毁（在主循环统一回收，避免当帧内继续使用引用）
+    pub pending_destroy: bool,
 }
 
 impl PasteWindow {
@@ -73,7 +94,9 @@ impl PasteWindow {
             let py = y - margin as i32;
             win.set_outer_position(winit::dpi::PhysicalPosition::new(px, py));
         }
-        let win: &'static Window = Box::leak(Box::new(win));
+        let boxed = Box::new(win);
+        let raw_window = Box::into_raw(boxed);
+        let win: &'static Window = unsafe { &*raw_window };
 
         // 禁用淡入淡出动画确保显示/隐藏即时反馈（Windows 平台）
         crate::windows_util::disable_window_transitions(win);
@@ -88,11 +111,24 @@ impl PasteWindow {
             )
             .map_err(|e| anyhow!("paste resize: {e}"))?;
         let (frame_focus, frame_unfocus) = build_frames(&pixels, w, h, margin);
+
+        // 构建右键菜单（两组：复制图像 | 分隔 | 销毁）
+        // 使用 Menu 构建，再通过 ContextMenu trait 提供 show_context_menu_for_hwnd 能力
+        let ctx_menu = Menu::new();
+        let copy_item = CtxMenuItem::new("复制图像", true, None);
+        let destroy_item = CtxMenuItem::new("销毁", true, None);
+        let copy_id = copy_item.id().clone();
+        let destroy_id = destroy_item.id().clone();
+        ctx_menu.append(&copy_item).ok();
+        ctx_menu.append(&PredefinedMenuItem::separator()).ok();
+        ctx_menu.append(&destroy_item).ok();
+
         win.set_visible(true);
         Ok(Self {
+            raw_window,
             window: win,
-            surface,
-            _context: context,
+            surface: Some(surface),
+            _context: Some(context),
             width: w,
             height: h,
             margin,
@@ -105,6 +141,11 @@ impl PasteWindow {
             frame_focus,
             frame_unfocus,
             last_local_cursor: (0.0, 0.0),
+            ctx_menu,
+            click_guard: ClickGuard::Idle,
+            ctx_copy_id: copy_id,
+            ctx_destroy_id: destroy_id,
+            pending_destroy: false,
         })
     }
 
@@ -122,33 +163,34 @@ impl PasteWindow {
                     }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                match state {
-                    ElementState::Pressed => {
-                        match button {
-                            MouseButton::Left => {
-                                self.dragging = true;
-                                self.focused = true;
-                                self.drag_offset = (
-                                    self.last_local_cursor.0 as i32,
-                                    self.last_local_cursor.1 as i32,
-                                );
-                            }
-                            MouseButton::Right => {
-                                // 右键隐藏（主循环会在 CloseRequested 中清理，这里直接 set_visible false 并发出请求）
-                                self.window.set_visible(false);
-                                self.window.request_redraw();
-                            }
-                            _ => {}
+            WindowEvent::MouseInput { state, button, .. } => match state {
+                ElementState::Pressed => match button {
+                    MouseButton::Left => {
+                        if self.click_guard == ClickGuard::SkipNext {
+                            // 消费一次并恢复
+                            self.click_guard = ClickGuard::Idle;
+                            return; // 不进入拖动
                         }
+
+                        self.dragging = true;
+                        self.focused = true;
+                        self.drag_offset = (
+                            self.last_local_cursor.0 as i32,
+                            self.last_local_cursor.1 as i32,
+                        );
                     }
-                    ElementState::Released => {
-                        if *button == MouseButton::Left {
-                            self.dragging = false;
-                        }
+                    _ => {}
+                },
+                ElementState::Released => match button {
+                    MouseButton::Left => {
+                        self.dragging = false;
                     }
-                }
-            }
+                    MouseButton::Right => {
+                        self.show_context_menu();
+                    }
+                    _ => {}
+                },
+            },
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -158,8 +200,8 @@ impl PasteWindow {
                     },
                 ..
             } => {
-                self.window.set_visible(false);
-                self.window.request_redraw();
+                // 标记销毁，交由主循环统一回收释放资源
+                self.pending_destroy = true;
             }
             WindowEvent::Focused(f) => {
                 self.focused = *f;
@@ -181,18 +223,78 @@ impl PasteWindow {
                 .request_inner_size(PhysicalSize::new(self.total_w, self.total_h));
         }
 
-        if let Ok(mut buf) = self.surface.buffer_mut() {
-            let src = if self.focused {
-                &self.frame_focus
-            } else {
-                &self.frame_unfocus
-            };
-            let need = (self.total_w * self.total_h) as usize;
-            if buf.len() >= need && src.len() == need {
-                buf[..need].copy_from_slice(src);
+        if let Some(surf) = &mut self.surface {
+            if let Ok(mut buf) = surf.buffer_mut() {
+                let src = if self.focused {
+                    &self.frame_focus
+                } else {
+                    &self.frame_unfocus
+                };
+                let need = (self.total_w * self.total_h) as usize;
+                if buf.len() >= need && src.len() == need {
+                    buf[..need].copy_from_slice(src);
+                }
+                let _ = buf.present();
             }
-            let _ = buf.present();
         }
+    }
+}
+
+impl PasteWindow {
+    fn show_context_menu(&mut self) {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let hwnd = if let Ok(h) = self.window.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    HWND(w.hwnd.get() as *mut _)
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            };
+
+            let (x, y) = self.last_local_cursor;
+            let pos = muda::dpi::PhysicalPosition { x, y };
+            self.ctx_menu
+                .show_context_menu_for_hwnd(hwnd.0 as isize, Some(pos.into()));
+            // 标记：下一次左键按下（用于关闭菜单）不启动拖动
+            self.click_guard = ClickGuard::SkipNext;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // TODO: gtk handle; 暂不实现
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            // TODO: nsview handle; 暂不实现
+        }
+    }
+
+    // 真正资源销毁：释放 surface/context 并回收 Window Box
+    pub fn destroy(&mut self) {
+        if self.raw_window.is_null() {
+            return;
+        }
+        self.window.set_visible(false);
+        if let Some(s) = self.surface.take() {
+            drop(s);
+        }
+        if let Some(c) = self._context.take() {
+            drop(c);
+        }
+        let raw = self.raw_window;
+        self.raw_window = std::ptr::null_mut();
+        unsafe {
+            drop(Box::from_raw(raw));
+        }
+        log::debug!("paste window resources destroyed");
+    }
+
+    pub fn is_pending_destroy(&self) -> bool {
+        self.pending_destroy
     }
 }
 

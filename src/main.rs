@@ -45,17 +45,41 @@ fn main() -> Result<()> {
         .with_menu(Box::new(tray_menu))
         .build()
         .ok();
+    // 仅需一个接收器（tray_icon::menu 与 muda::MenuEvent 实际共用同一全局通道）
     let menu_event_rx = MenuEvent::receiver();
     let mut paste_windows: Vec<PasteWindow> = Vec::new(); // 多 PasteWindow
     let mut hotkey_rx = subscribe_f4().ok();
     let mut overlay: Option<OverlayState> = None;
     let _ = event_loop.run(|event, elwt| match event {
         Event::AboutToWait => {
-            // 菜单事件处理（退出）
             while let Ok(ev) = menu_event_rx.try_recv() {
+                // 1) 托盘退出
                 if ev.id == quit_item.id() {
+                    log::debug!("quit menu selected");
                     elwt.exit();
-                    return; // 直接退出
+                    return;
+                }
+                // 2) 单次线性扫描：同时识别 copy / destroy（窗口数量一般很少，O(n) 足够）
+                let mut remove_index: Option<usize> = None;
+                for (i, pw) in paste_windows.iter().enumerate() {
+                    if ev.id == pw.ctx_copy_id {
+                        log::debug!("context copy placeholder triggered id={:?}", ev.id);
+                        // TODO: 实现剪贴板复制
+                        break; // 复制不需要继续找
+                    }
+                    if ev.id == pw.ctx_destroy_id {
+                        remove_index = Some(i);
+                        break;
+                    }
+                }
+                if let Some(idx) = remove_index {
+                    log::debug!(
+                        "context destroy triggered id={:?} removing window #{}",
+                        ev.id,
+                        idx
+                    );
+                    let mut pw = paste_windows.remove(idx);
+                    pw.destroy();
                 }
             }
             // 轮询热键事件：进入 overlay 选区模式
@@ -88,6 +112,13 @@ fn main() -> Result<()> {
             for pw in paste_windows.iter_mut() {
                 let id = pw.window.id();
                 pw.redraw(id);
+            }
+            // 回收 ESC 标记待销毁窗口（倒序遍历避免索引错位）
+            for i in (0..paste_windows.len()).rev() {
+                if paste_windows[i].is_pending_destroy() {
+                    let mut pw = paste_windows.remove(i);
+                    pw.destroy();
+                }
             }
         }
         Event::WindowEvent {

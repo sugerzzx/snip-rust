@@ -2832,6 +2832,7 @@ dependencies = [
  "ico",
  "image 0.25.8",
  "log",
+ "muda",
  "screenshots",
  "softbuffer",
  "tiny-skia",
