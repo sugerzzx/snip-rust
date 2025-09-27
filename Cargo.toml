@@ -19,6 +19,11 @@ softbuffer = "0.4.0"
 tiny-skia = "0.11.4"
 bytemuck = { version = "1.16", features = ["derive"] }
 tray-icon = "0.21.1"
+windows = { version = "0.62.1", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 winres = "0.1"

@@ -78,6 +78,10 @@ impl OverlayState {
             .with_skip_taskbar(true);
         let window = active.create_window(attrs)?;
         let window: &'static Window = Box::leak(Box::new(window));
+
+        // 禁用窗口淡入淡出动画，提升显隐响应（Windows）
+        crate::windows_util::disable_window_transitions(window);
+
         let context = Context::new(window).map_err(|e| anyhow!("overlay ctx: {e}"))?;
         let surface =
             Surface::new(&context, window).map_err(|e| anyhow!("overlay surface: {e}"))?;

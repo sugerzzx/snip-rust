@@ -62,7 +62,7 @@ impl PasteWindow {
             .with_title("Snip Paste")
             .with_decorations(false)
             .with_resizable(false)
-            .with_visible(true)
+            .with_visible(false) // 先隐藏创建，避免“闪一下”或内容空白再填充的视觉差
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_inner_size(PhysicalSize::new(total_w, total_h))
             .with_skip_taskbar(true);
@@ -74,6 +74,10 @@ impl PasteWindow {
             win.set_outer_position(winit::dpi::PhysicalPosition::new(px, py));
         }
         let win: &'static Window = Box::leak(Box::new(win));
+
+        // 禁用淡入淡出动画确保显示/隐藏即时反馈（Windows 平台）
+        crate::windows_util::disable_window_transitions(win);
+
         let context = Context::new(win).map_err(|e| anyhow!("paste ctx: {e}"))?;
         let mut surface = Surface::new(&context, win).map_err(|e| anyhow!("paste surface: {e}"))?;
         use std::num::NonZeroU32;
@@ -84,6 +88,7 @@ impl PasteWindow {
             )
             .map_err(|e| anyhow!("paste resize: {e}"))?;
         let (frame_focus, frame_unfocus) = build_frames(&pixels, w, h, margin);
+        win.set_visible(true);
         Ok(Self {
             window: win,
             surface,
