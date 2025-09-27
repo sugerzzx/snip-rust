@@ -121,6 +121,7 @@ impl OverlayState {
             .set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
         self.build_caches();
         self.window.request_redraw();
+        self.window.focus_window();
         Ok(())
     }
 
