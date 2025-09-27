@@ -206,6 +206,28 @@ impl OverlayState {
                     }
                 }
             },
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Right,
+                ..
+            } => match state {
+                ElementState::Pressed => match self.mode {
+                    OverlayMode::Idle => {
+                        self.hide();
+                    }
+                    OverlayMode::IdleWithSelection => {
+                        self.selection = None;
+                        self.mode = OverlayMode::Idle;
+                        self.window.set_cursor(CursorIcon::Crosshair);
+                        self.window.request_redraw();
+                    }
+                    OverlayMode::Dragging
+                    | OverlayMode::MovingSelection
+                    | OverlayMode::Resizing
+                    | OverlayMode::Annotating => {}
+                },
+                ElementState::Released => {}
+            },
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = (position.x, position.y);
                 match self.mode {
