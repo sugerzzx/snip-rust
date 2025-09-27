@@ -95,6 +95,10 @@ Windows CMD：
 
 ```
 set RUST_LOG=debug && cargo run
+
+### 单实例
+
+Windows 通过命名互斥体 `Global\\SnipRustSingletonMutex` 限制多开。若已在运行，第二次启动会立即退出（控制台输出一条提示）。其它平台暂未启用该限制。
 ```
 
 ## 设计要点

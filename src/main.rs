@@ -17,9 +17,18 @@ use snip_rust::capture::capture_fullscreen_raw_with_origin;
 use snip_rust::hotkey::subscribe_f4;
 use snip_rust::overlay::{OverlayAction, OverlayState};
 use snip_rust::paste_window::PasteWindow;
+mod single_instance;
 
 #[allow(deprecated)]
 fn main() -> Result<()> {
+    // 单实例：若已存在实例则安静退出
+    let _instance_guard = match single_instance::acquire_single_instance() {
+        Some(g) => g,
+        None => {
+            println!("snip_rust: 已有实例在运行，退出");
+            return Ok(());
+        }
+    };
     env_logger::init();
     info!("starting snip_rust (overlay + paste mode + tray)");
     let event_loop = EventLoop::new()?;
