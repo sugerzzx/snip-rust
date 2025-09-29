@@ -1,5 +1,4 @@
 use crate::overlay::drawing::{fill_rect, set_px, stroke_rect};
-use crate::overlay::handles::ResizeHandle; // may be used later for hover states
 
 pub const TB_BUTTONS: usize = 5; // Exit / Pin / Save / Copy / Annotate
 const TB_BTN_W: i32 = 48;
@@ -180,7 +179,7 @@ fn icon_exit(
     x: i32,
     y: i32,
     w: i32,
-    h: i32,
+    _h: i32,
     color: u32,
 ) {
     for i in 0..w {

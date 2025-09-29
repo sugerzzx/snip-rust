@@ -35,3 +35,23 @@ pub fn disable_window_transitions(window: &winit::window::Window) {
         }
     }
 }
+
+#[cfg(target_os = "windows")]
+pub fn current_cursor_position() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    unsafe {
+        let mut point = POINT::default();
+        if GetCursorPos(&mut point).is_ok() {
+            Some((point.x, point.y))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn current_cursor_position() -> Option<(i32, i32)> {
+    None
+}

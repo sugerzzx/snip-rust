@@ -12,9 +12,11 @@ use winit::{
     },
 };
 
+use crate::overlay::auto_detect::{detect_rectangles, DetectedRect};
 use crate::overlay::drawing::draw_handle;
 use crate::overlay::handles::{hit_test_handle, ResizeHandle};
 use crate::overlay::toolbar::{compute_toolbar_rect, draw_toolbar, hit_test_toolbar_button};
+use log::warn;
 
 // OverlayAction: 外部事件结果（当前仍只返回 None；按钮交互未来扩展）
 pub enum OverlayAction {
@@ -40,10 +42,16 @@ pub enum OverlayMode {
     Annotating,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionSource {
+    Auto,
+    Manual,
+}
+
 // OverlayState: 全屏覆盖层，基于预先截取的原始 RGBA 图像进行交互式选区
 pub struct OverlayState {
     pub window: &'static Window,
-    context: Context<&'static Window>,
+    _context: Context<&'static Window>,
     surface: Surface<&'static Window, &'static Window>,
     pub visible: bool,
     pub screenshot: Option<(u32, u32, Vec<u8>)>, // 原始 RGBA
@@ -57,6 +65,8 @@ pub struct OverlayState {
     resize_handle: Option<ResizeHandle>,
     toolbar_rect: Option<(i32, i32, i32, i32)>, // 缓存当前工具栏矩形（屏幕内坐标）
     toolbar_hover: Option<usize>,               // 当前悬停按钮
+    auto_rects: Vec<DetectedRect>,
+    selection_source: Option<SelectionSource>,
 }
 
 impl OverlayState {
@@ -86,7 +96,7 @@ impl OverlayState {
             Surface::new(&context, window).map_err(|e| anyhow!("overlay surface: {e}"))?;
         Ok(Self {
             window,
-            context,
+            _context: context,
             surface,
             visible: false,
             screenshot: None,
@@ -100,6 +110,8 @@ impl OverlayState {
             resize_handle: None,
             toolbar_rect: None,
             toolbar_hover: None,
+            auto_rects: Vec::new(),
+            selection_source: None,
         })
     }
 
@@ -114,12 +126,17 @@ impl OverlayState {
         self.origin = origin;
         self.selection = None;
         self.drag_start = None;
+        self.selection_source = None;
+        self.auto_rects.clear();
         self.visible = true;
         self.mode = OverlayMode::Idle;
         self.window.set_visible(true);
         self.window
             .set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
         self.build_caches();
+        self.compute_auto_rects();
+        self.sync_cursor_position();
+        self.update_auto_selection_for_cursor(true);
         self.window.request_redraw();
         self.window.focus_window();
         Ok(())
@@ -134,6 +151,8 @@ impl OverlayState {
         self.selection = None;
         self.drag_start = None;
         self.dim_cache = None;
+        self.auto_rects.clear();
+        self.selection_source = None;
         // 主动收缩可能的临时 Vec 容量（注意 allocator 可能仍保留，但可提示归还）
         // 由于我们把 Option<Vec<_>> 设为 None，这里暂无直接 shrink；若后续改为复用缓冲则可调用 shrink_to_fit。
     }
@@ -153,6 +172,7 @@ impl OverlayState {
                     OverlayMode::Idle => {
                         self.drag_start = Some(self.last_cursor);
                         self.selection = None;
+                        self.selection_source = Some(SelectionSource::Manual);
                         self.mode = OverlayMode::Dragging;
                         self.window.request_redraw();
                     }
@@ -162,6 +182,7 @@ impl OverlayState {
                             if let Some(handle) = hit_test_handle(cx, cy, x, y, w, h) {
                                 self.resize_handle = Some(handle);
                                 self.mode = OverlayMode::Resizing;
+                                self.selection_source = Some(SelectionSource::Manual);
                             } else if cx >= x as i32
                                 && cy >= y as i32
                                 && cx < (x + w) as i32
@@ -169,6 +190,7 @@ impl OverlayState {
                             {
                                 self.move_offset = Some((cx - x as i32, cy - y as i32));
                                 self.mode = OverlayMode::MovingSelection;
+                                self.selection_source = Some(SelectionSource::Manual);
                             }
                         }
                     }
@@ -192,8 +214,10 @@ impl OverlayState {
                         OverlayMode::Dragging => {
                             self.drag_start = None;
                             if self.selection.is_some() {
+                                self.selection_source = Some(SelectionSource::Manual);
                                 self.mode = OverlayMode::IdleWithSelection;
                             } else {
+                                self.selection_source = None;
                                 self.mode = OverlayMode::Idle;
                             }
                         }
@@ -221,6 +245,7 @@ impl OverlayState {
                     OverlayMode::IdleWithSelection => {
                         self.selection = None;
                         self.mode = OverlayMode::Idle;
+                        self.selection_source = None;
                         self.window.set_cursor(CursorIcon::Crosshair);
                         self.window.request_redraw();
                     }
@@ -233,6 +258,23 @@ impl OverlayState {
             },
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = (position.x, position.y);
+                let cursor_i = (position.x as i32, position.y as i32);
+                let hovering_toolbar = self
+                    .toolbar_rect
+                    .map(|(bx, by, bw, bh)| {
+                        cursor_i.0 >= bx
+                            && cursor_i.1 >= by
+                            && cursor_i.0 < bx + bw
+                            && cursor_i.1 < by + bh
+                    })
+                    .unwrap_or(false);
+                if matches!(
+                    self.mode,
+                    OverlayMode::Idle | OverlayMode::IdleWithSelection
+                ) && !hovering_toolbar
+                {
+                    self.update_auto_selection_for_cursor(false);
+                }
                 match self.mode {
                     OverlayMode::Dragging => {
                         if let Some((sx, sy)) = self.drag_start {
@@ -241,6 +283,9 @@ impl OverlayState {
                             let w = (sx - position.x).abs();
                             let h = (sy - position.y).abs();
                             self.selection = Some((x0 as u32, y0 as u32, w as u32, h as u32));
+                            if w >= 1.0 && h >= 1.0 {
+                                self.selection_source = Some(SelectionSource::Manual);
+                            }
                             self.window.request_redraw();
                         }
                     }
@@ -267,6 +312,7 @@ impl OverlayState {
                                 new_y = max_y;
                             }
                             self.selection = Some((new_x as u32, new_y as u32, w, h));
+                            self.selection_source = Some(SelectionSource::Manual);
                             self.window.request_redraw();
                         }
                     }
@@ -342,13 +388,13 @@ impl OverlayState {
                                 rh = *sh as i32 - y;
                             }
                             self.selection = Some((x as u32, y as u32, rw as u32, rh as u32));
+                            self.selection_source = Some(SelectionSource::Manual);
                             self.window.request_redraw();
                         }
                     }
                     OverlayMode::IdleWithSelection => {
                         if let Some((x, y, w, h)) = self.selection {
                             let (cx, cy) = (position.x as i32, position.y as i32);
-                            // 1. 工具栏 hover 检测（若命中则直接使用 Pointer，不再继续后续手柄/区域判定）
                             let mut over_toolbar = false;
                             if let Some((bx, by, bw, bh)) = self.toolbar_rect {
                                 if let Some(btn) = hit_test_toolbar_button(cx, cy, bx, by, bw, bh) {
@@ -363,7 +409,6 @@ impl OverlayState {
                             }
 
                             if !over_toolbar {
-                                // 2. 手柄与选区区域判定
                                 if let Some(handle) = hit_test_handle(cx, cy, x, y, w, h) {
                                     let icon = match handle {
                                         ResizeHandle::Top | ResizeHandle::Bottom => NsResize,
@@ -382,11 +427,8 @@ impl OverlayState {
                                     && cy < (y + h) as i32
                                 {
                                     self.window.set_cursor(CursorIcon::Move);
-                                } else {
-                                    if self.toolbar_hover.is_none() {
-                                        self.window.set_cursor(CursorIcon::Default);
-                                    }
-                                    // 已被 toolbar hover 设置，不处理
+                                } else if self.toolbar_hover.is_none() {
+                                    self.window.set_cursor(CursorIcon::Default);
                                 }
                             }
                         }
@@ -568,6 +610,125 @@ impl OverlayState {
         } else {
             self.dim_cache = None;
         }
+    }
+
+    fn compute_auto_rects(&mut self) {
+        if let Some((w, h, ref buf)) = self.screenshot {
+            match detect_rectangles(w, h, buf) {
+                Ok(mut rects) => {
+                    if rects.is_empty() {
+                        let full_w = w.min(i32::MAX as u32) as i32;
+                        let full_h = h.min(i32::MAX as u32) as i32;
+                        rects.push(DetectedRect::new(0, 0, full_w, full_h, 0.05));
+                    }
+                    self.auto_rects = rects;
+                }
+                Err(err) => {
+                    warn!("auto rectangle detection failed: {err}");
+                    self.auto_rects.clear();
+                    let full_w = w.min(i32::MAX as u32) as i32;
+                    let full_h = h.min(i32::MAX as u32) as i32;
+                    self.auto_rects
+                        .push(DetectedRect::new(0, 0, full_w, full_h, 0.05));
+                }
+            }
+        } else {
+            self.auto_rects.clear();
+        }
+    }
+
+    fn sync_cursor_position(&mut self) {
+        if let Some((w, h, _)) = self.screenshot {
+            if let Some((gx, gy)) = crate::windows_util::current_cursor_position() {
+                let rel_x = (gx - self.origin.0) as f64;
+                let rel_y = (gy - self.origin.1) as f64;
+                if rel_x >= 0.0 && rel_y >= 0.0 && rel_x < w as f64 && rel_y < h as f64 {
+                    self.last_cursor = (rel_x, rel_y);
+                }
+            }
+        }
+    }
+
+    fn update_auto_selection_for_cursor(&mut self, force: bool) {
+        if !force && matches!(self.selection_source, Some(SelectionSource::Manual)) {
+            return;
+        }
+        if matches!(
+            self.mode,
+            OverlayMode::Dragging
+                | OverlayMode::MovingSelection
+                | OverlayMode::Resizing
+                | OverlayMode::Annotating
+        ) {
+            return;
+        }
+        let (sw, sh, _) = match self.screenshot.as_ref() {
+            Some(data) => data,
+            None => return,
+        };
+        let sw = *sw;
+        let sh = *sh;
+        if sw == 0 || sh == 0 {
+            return;
+        }
+        let cx = self.last_cursor.0.round() as i32;
+        let cy = self.last_cursor.1.round() as i32;
+        if cx < 0 || cy < 0 || cx >= sw as i32 || cy >= sh as i32 {
+            return;
+        }
+        if self.auto_rects.is_empty() {
+            let full_w = sw.min(i32::MAX as u32) as i32;
+            let full_h = sh.min(i32::MAX as u32) as i32;
+            self.auto_rects
+                .push(DetectedRect::new(0, 0, full_w, full_h, 0.05));
+        }
+        let mut best_rect: Option<&DetectedRect> = None;
+        let mut best_score = f32::MIN;
+        for rect in &self.auto_rects {
+            if !rect.contains(cx, cy) {
+                continue;
+            }
+            let score = rect.composite_score(cx, cy);
+            if score > best_score || best_rect.is_none() {
+                best_score = score;
+                best_rect = Some(rect);
+            }
+        }
+
+        let rect = match best_rect {
+            Some(r) => r,
+            None => return,
+        };
+
+        let mut x = rect.x.max(0) as u32;
+        let mut y = rect.y.max(0) as u32;
+        let mut w = rect.width.max(1) as u32;
+        let mut h = rect.height.max(1) as u32;
+        if x >= sw {
+            x = sw.saturating_sub(1);
+        }
+        if y >= sh {
+            y = sh.saturating_sub(1);
+        }
+        w = w.min(sw.saturating_sub(x).max(1));
+        h = h.min(sh.saturating_sub(y).max(1));
+        if w == 0 || h == 0 {
+            return;
+        }
+        let new_selection = (x, y, w, h);
+        if !force {
+            if let Some(current) = self.selection {
+                if current == new_selection {
+                    return;
+                }
+            }
+        }
+        self.selection = Some(new_selection);
+        self.mode = OverlayMode::IdleWithSelection;
+        self.selection_source = Some(SelectionSource::Auto);
+        self.toolbar_rect = None;
+        self.toolbar_hover = None;
+        self.window.request_redraw();
     }
 }
 

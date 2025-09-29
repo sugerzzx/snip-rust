@@ -1,3 +1,4 @@
+pub mod auto_detect;
 pub mod drawing;
 pub mod handles;
 pub mod state;

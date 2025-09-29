@@ -6,7 +6,7 @@ use std::thread;
 
 /// 订阅 F4 按下事件：每次按下发送一个 ()，持续有效。
 pub fn subscribe_f4() -> Result<Receiver<()>> {
-    use global_hotkey::hotkey::{Code, Modifiers};
+    use global_hotkey::hotkey::Code;
     let manager: &'static mut GlobalHotKeyManager =
         Box::leak(Box::new(GlobalHotKeyManager::new()?));
     let hotkey = HotKey::new(None, Code::F4);
