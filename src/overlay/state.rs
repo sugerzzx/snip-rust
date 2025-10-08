@@ -12,6 +12,9 @@ use winit::{
     },
 };
 
+#[cfg(target_os = "windows")]
+use crate::overlay::auto_detect::register_overlay_hwnd;
+use crate::overlay::auto_detect::{detect_rectangles, DetectedRect};
 use crate::overlay::drawing::draw_handle;
 use crate::overlay::handles::{hit_test_handle, ResizeHandle};
 use crate::overlay::toolbar::{compute_toolbar_rect, draw_toolbar, hit_test_toolbar_button};
@@ -43,6 +46,7 @@ pub enum OverlayMode {
 // OverlayState: 全屏覆盖层，基于预先截取的原始 RGBA 图像进行交互式选区
 pub struct OverlayState {
     pub window: &'static Window,
+    #[allow(dead_code)]
     context: Context<&'static Window>,
     surface: Surface<&'static Window, &'static Window>,
     pub visible: bool,
@@ -57,6 +61,10 @@ pub struct OverlayState {
     resize_handle: Option<ResizeHandle>,
     toolbar_rect: Option<(i32, i32, i32, i32)>, // 缓存当前工具栏矩形（屏幕内坐标）
     toolbar_hover: Option<usize>,               // 当前悬停按钮
+    auto_rects: Vec<DetectedRect>,              // 自动识别的矩形候选
+    auto_hover: Option<usize>,                  // 当前鼠标所在的候选索引
+    pending_auto_rect: Option<(u32, u32, u32, u32)>,
+    drag_has_moved: bool,
 }
 
 impl OverlayState {
@@ -77,6 +85,16 @@ impl OverlayState {
             .with_skip_taskbar(true);
         let window = active.create_window(attrs)?;
         let window: &'static Window = Box::leak(Box::new(window));
+
+        #[cfg(target_os = "windows")]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = window.window_handle() {
+                if let RawWindowHandle::Win32(win) = h.as_raw() {
+                    register_overlay_hwnd(win.hwnd.get() as isize);
+                }
+            }
+        }
 
         // 禁用窗口淡入淡出动画，提升显隐响应（Windows）
         crate::windows_util::disable_window_transitions(window);
@@ -100,6 +118,10 @@ impl OverlayState {
             resize_handle: None,
             toolbar_rect: None,
             toolbar_hover: None,
+            auto_rects: Vec::new(),
+            auto_hover: None,
+            pending_auto_rect: None,
+            drag_has_moved: false,
         })
     }
 
@@ -116,10 +138,14 @@ impl OverlayState {
         self.drag_start = None;
         self.visible = true;
         self.mode = OverlayMode::Idle;
+        self.auto_hover = None;
+        self.pending_auto_rect = None;
+        self.drag_has_moved = false;
         self.window.set_visible(true);
         self.window
             .set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
         self.build_caches();
+        self.build_auto_rectangles();
         self.window.request_redraw();
         self.window.focus_window();
         Ok(())
@@ -134,6 +160,10 @@ impl OverlayState {
         self.selection = None;
         self.drag_start = None;
         self.dim_cache = None;
+        self.auto_rects.clear();
+        self.auto_hover = None;
+        self.pending_auto_rect = None;
+        self.drag_has_moved = false;
         // 主动收缩可能的临时 Vec 容量（注意 allocator 可能仍保留，但可提示归还）
         // 由于我们把 Option<Vec<_>> 设为 None，这里暂无直接 shrink；若后续改为复用缓冲则可调用 shrink_to_fit。
     }
@@ -154,6 +184,8 @@ impl OverlayState {
                         self.drag_start = Some(self.last_cursor);
                         self.selection = None;
                         self.mode = OverlayMode::Dragging;
+                        self.drag_has_moved = false;
+                        self.pending_auto_rect = self.auto_hover_rect();
                         self.window.request_redraw();
                     }
                     OverlayMode::IdleWithSelection => {
@@ -191,11 +223,33 @@ impl OverlayState {
                     match self.mode {
                         OverlayMode::Dragging => {
                             self.drag_start = None;
-                            if self.selection.is_some() {
-                                self.mode = OverlayMode::IdleWithSelection;
+                            let mut next_mode = OverlayMode::Idle;
+                            if self.drag_has_moved {
+                                if let Some((_, _, w, h)) = self.selection {
+                                    if w > 0 && h > 0 {
+                                        next_mode = OverlayMode::IdleWithSelection;
+                                        self.auto_hover = None;
+                                    } else {
+                                        self.selection = None;
+                                    }
+                                } else {
+                                    self.selection = None;
+                                }
+                            } else if let Some(rect) = self.pending_auto_rect.take() {
+                                if rect.2 > 0 && rect.3 > 0 {
+                                    self.selection = Some(rect);
+                                    next_mode = OverlayMode::IdleWithSelection;
+                                    self.auto_hover = None;
+                                } else {
+                                    self.selection = None;
+                                }
                             } else {
-                                self.mode = OverlayMode::Idle;
+                                self.selection = None;
                             }
+                            self.mode = next_mode;
+                            self.drag_has_moved = false;
+                            self.pending_auto_rect = None;
+                            self.window.request_redraw();
                         }
                         OverlayMode::MovingSelection => {
                             self.move_offset = None;
@@ -234,13 +288,32 @@ impl OverlayState {
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = (position.x, position.y);
                 match self.mode {
+                    OverlayMode::Idle => {
+                        let changed = self.update_auto_hover(position.x as i32, position.y as i32);
+                        if changed {
+                            self.window.request_redraw();
+                        }
+                        self.window.set_cursor(CursorIcon::Crosshair);
+                    }
                     OverlayMode::Dragging => {
                         if let Some((sx, sy)) = self.drag_start {
-                            let x0 = sx.min(position.x);
-                            let y0 = sy.min(position.y);
-                            let w = (sx - position.x).abs();
-                            let h = (sy - position.y).abs();
-                            self.selection = Some((x0 as u32, y0 as u32, w as u32, h as u32));
+                            const DRAG_THRESHOLD: f64 = 2.0;
+                            let dx = (position.x - sx).abs();
+                            let dy = (position.y - sy).abs();
+                            let beyond_threshold = dx > DRAG_THRESHOLD || dy > DRAG_THRESHOLD;
+                            if beyond_threshold && !self.drag_has_moved {
+                                self.drag_has_moved = true;
+                                self.pending_auto_rect = None;
+                            }
+                            if self.drag_has_moved {
+                                let x0 = sx.min(position.x);
+                                let y0 = sy.min(position.y);
+                                let w = (sx - position.x).abs();
+                                let h = (sy - position.y).abs();
+                                self.selection = Some((x0 as u32, y0 as u32, w as u32, h as u32));
+                            } else {
+                                self.selection = None;
+                            }
                             self.window.request_redraw();
                         }
                     }
@@ -423,6 +496,29 @@ impl OverlayState {
                 NonZeroU32::new(width).unwrap(),
                 NonZeroU32::new(height).unwrap(),
             );
+            enum RectKind {
+                Selection,
+                Hover,
+            }
+
+            let (rect_kind, rect_to_draw) = if let Some(sel) = self.selection {
+                (RectKind::Selection, Some(sel))
+            } else if matches!(self.mode, OverlayMode::Idle) {
+                if let Some(hover) = self.auto_hover_rect() {
+                    (RectKind::Hover, Some(hover))
+                } else {
+                    (RectKind::Selection, None)
+                }
+            } else if matches!(self.mode, OverlayMode::Dragging) {
+                if let Some(rect) = self.pending_auto_rect {
+                    (RectKind::Hover, Some(rect))
+                } else {
+                    (RectKind::Selection, None)
+                }
+            } else {
+                (RectKind::Selection, None)
+            };
+
             if let Ok(mut frame) = self.surface.buffer_mut() {
                 if let Some(cache) = &self.dim_cache {
                     let copy_w = sw.min(width);
@@ -436,17 +532,19 @@ impl OverlayState {
                 } else {
                     frame.fill(0x88000000);
                 }
-                if let Some((x, y, w, h)) = self.selection {
-                    let x2 = (x + w).saturating_sub(1);
-                    let y2 = (y + h).saturating_sub(1);
+
+                if let Some((x, y, w, h)) = rect_to_draw {
                     if w > 0 && h > 0 {
-                        if matches!(
+                        let x2 = (x + w).saturating_sub(1);
+                        let y2 = (y + h).saturating_sub(1);
+                        let should_restore = matches!(
                             self.mode,
                             OverlayMode::Dragging
                                 | OverlayMode::IdleWithSelection
                                 | OverlayMode::MovingSelection
                                 | OverlayMode::Resizing
-                        ) {
+                        ) || matches!(rect_kind, RectKind::Hover);
+                        if should_restore {
                             if let Some((sw, sh, buf)) = &self.screenshot {
                                 let copy_w = w.min(*sw - x).min(width - x);
                                 let copy_h = h.min(*sh - y).min(height - y);
@@ -466,51 +564,57 @@ impl OverlayState {
                                 }
                             }
                         }
+                        let border_color = 0xFF3DA5F4u32;
                         for i in x..=x2.min(width - 1) {
                             let top = (y.min(height - 1) * width + i) as usize;
-                            frame[top] = 0xFFFFFFFF;
+                            frame[top] = border_color;
                             let bottom_y = y2.min(height - 1);
                             let bottom = (bottom_y * width + i) as usize;
-                            frame[bottom] = 0xFFFFFFFF;
+                            frame[bottom] = border_color;
                         }
                         for j in y..=y2.min(height - 1) {
                             let left = (j * width + x.min(width - 1)) as usize;
-                            frame[left] = 0xFFFFFFFF;
+                            frame[left] = border_color;
                             let right_x = x2.min(width - 1);
                             let right = (j * width + right_x) as usize;
-                            frame[right] = 0xFFFFFFFF;
+                            frame[right] = border_color;
                         }
-                        let handle_size: i32 = 6;
-                        let hs2 = handle_size / 2;
-                        let centers = [
-                            (x as i32, y as i32),
-                            ((x + w / 2) as i32, y as i32),
-                            ((x + w) as i32 - 1, y as i32),
-                            ((x + w) as i32 - 1, (y + h / 2) as i32),
-                            ((x + w) as i32 - 1, (y + h) as i32 - 1),
-                            ((x + w / 2) as i32, (y + h) as i32 - 1),
-                            (x as i32, (y + h) as i32 - 1),
-                            (x as i32, (y + h / 2) as i32),
-                        ];
-                        for (cx, cy) in centers {
-                            draw_handle(&mut frame, width, height, cx, cy, hs2);
-                        }
-                        if matches!(self.mode, OverlayMode::IdleWithSelection) {
-                            self.toolbar_rect = compute_toolbar_rect(x, y, w, h, sw, sh);
-                            if let Some((bar_x, bar_y, bar_w, bar_h)) = self.toolbar_rect {
-                                draw_toolbar(
-                                    &mut frame,
-                                    width,
-                                    height,
-                                    bar_x,
-                                    bar_y,
-                                    bar_w,
-                                    bar_h,
-                                    self.toolbar_hover,
-                                );
+                        if matches!(rect_kind, RectKind::Selection) {
+                            let handle_size: i32 = 6;
+                            let hs2 = handle_size / 2;
+                            let centers = [
+                                (x as i32, y as i32),
+                                ((x + w / 2) as i32, y as i32),
+                                ((x + w) as i32 - 1, y as i32),
+                                ((x + w) as i32 - 1, (y + h / 2) as i32),
+                                ((x + w) as i32 - 1, (y + h) as i32 - 1),
+                                ((x + w / 2) as i32, (y + h) as i32 - 1),
+                                (x as i32, (y + h) as i32 - 1),
+                                (x as i32, (y + h / 2) as i32),
+                            ];
+                            for (cx, cy) in centers {
+                                draw_handle(&mut frame, width, height, cx, cy, hs2);
+                            }
+                            if matches!(self.mode, OverlayMode::IdleWithSelection) {
+                                self.toolbar_rect = compute_toolbar_rect(x, y, w, h, sw, sh);
+                                if let Some((bar_x, bar_y, bar_w, bar_h)) = self.toolbar_rect {
+                                    draw_toolbar(
+                                        &mut frame,
+                                        width,
+                                        height,
+                                        bar_x,
+                                        bar_y,
+                                        bar_w,
+                                        bar_h,
+                                        self.toolbar_hover,
+                                    );
+                                }
+                            } else {
+                                self.toolbar_rect = None;
                             }
                         } else {
                             self.toolbar_rect = None;
+                            self.toolbar_hover = None;
                         }
                     }
                 }
@@ -550,6 +654,68 @@ impl OverlayState {
             }
         }
         Some(png_data)
+    }
+
+    fn build_auto_rectangles(&mut self) {
+        self.auto_hover = None;
+        self.auto_rects.clear();
+        if let Some((w, h, ref buf)) = self.screenshot {
+            match detect_rectangles(w, h, buf) {
+                Ok(rects) => {
+                    self.auto_rects = rects;
+                }
+                Err(err) => {
+                    log::warn!("auto detect rectangles failed: {err}");
+                    self.auto_rects.clear();
+                }
+            }
+        }
+    }
+
+    fn update_auto_hover(&mut self, cursor_x: i32, cursor_y: i32) -> bool {
+        let mut new_hover = None;
+        let mut smallest_area = i64::MAX;
+        for (idx, rect) in self.auto_rects.iter().enumerate() {
+            if rect.contains(cursor_x, cursor_y) {
+                let area = rect.area();
+                if area < smallest_area {
+                    smallest_area = area;
+                    new_hover = Some(idx);
+                }
+            }
+        }
+        if new_hover != self.auto_hover {
+            self.auto_hover = new_hover;
+            return true;
+        }
+        false
+    }
+
+    fn auto_hover_rect(&self) -> Option<(u32, u32, u32, u32)> {
+        let idx = self.auto_hover?;
+        let rect = self.auto_rects.get(idx)?;
+        if rect.width <= 0 || rect.height <= 0 {
+            return None;
+        }
+        let x = rect.x.max(0) as u32;
+        let y = rect.y.max(0) as u32;
+        let mut w = rect.width as u32;
+        let mut h = rect.height as u32;
+        if let Some((sw, sh, _)) = &self.screenshot {
+            if x >= *sw || y >= *sh {
+                return None;
+            }
+            if x + w > *sw {
+                w = sw.saturating_sub(x);
+            }
+            if y + h > *sh {
+                h = sh.saturating_sub(y);
+            }
+        }
+        if w == 0 || h == 0 {
+            return None;
+        }
+        Some((x, y, w, h))
     }
 
     fn build_caches(&mut self) {
