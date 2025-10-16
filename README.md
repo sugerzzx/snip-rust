@@ -34,6 +34,7 @@ examples/
   - 拖拽左键：动态显示选区边框
   - Idle 模式自动检测界面矩形：悬停高亮，单击可直接吸附选区
   - 松开左键：裁剪区域 -> PNG 解码到主窗口显示
+  - Windows 下 Overlay 始终沿用 `WS_EX_LAYERED`，自动检测时临时添加 `WS_EX_TRANSPARENT` 以实现“穿透悬停”，避免闪烁
 - 颜色通道适配（Windows BGRA / RGBA 切换 via 逻辑转换）
 - Softbuffer 提交前自动 resize，避免 panic
 - 简单 BGRA <-> 显示转换（`renderer.as_bgra_u32()`）
@@ -65,10 +66,12 @@ cargo run
 
 ### 自动检测策略 (概览)
 
-当前 Windows 下融合：
+当前 Windows 策略：
 
 1. 系统窗口 / 子控件枚举 (EnumWindows + EnumChildWindows)：快速得到真实窗口矩形（排除工具窗口、最小化、不可见窗口）。
-2. 边缘检测：Canny + 轮廓层次结构挖掘较大 UI 区域。
+2. UI Automation (IUIAutomation)：针对当前鼠标所在的顶层窗口按需枚举控件，结合 `ElementFromPoint` 精确锁定光标下的控件。
+
+实现细节：Overlay 捕获 HWND 后注册到自动检测模块，检测期间通过 `with_overlay_click_through` 临时启用 `WS_EX_TRANSPARENT` 以保证 `WindowFromPoint / ElementFromPoint` 能命中下层窗口；检测结束即恢复原始扩展样式，不会影响后续交互。
 
 评分优先级：系统窗口矩形给予较高基础分（0.85+），其余策略融合按紧凑度 / Solidity / 面积比给予加权；悬停时选择“包含鼠标点的最小矩形”以便快速吸附。
 
@@ -97,9 +100,10 @@ cargo run --example auto_detect_demo
 
 ## 环境变量
 
-| 变量              | 说明                                                          |
-| ----------------- | ------------------------------------------------------------- |
-| `SNIP_FORCE_BGRA` | 若设置任意值，则假定截图缓冲是 BGRA 并做转换（调试/兼容用途） |
+| 变量               | 说明                                                          |
+| ------------------ | ------------------------------------------------------------- |
+| `SNIP_FORCE_BGRA`  | 若设置任意值，则假定截图缓冲是 BGRA 并做转换（调试/兼容用途） |
+| `SNIP_ASSUME_BGRA` | 在渲染路径中跳过 RGBA→BGRA 调换，直接按 BGRA 写入 softbuffer  |
 
 ## 构建与运行
 

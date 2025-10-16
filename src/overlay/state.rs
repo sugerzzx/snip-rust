@@ -14,7 +14,19 @@ use winit::{
 
 #[cfg(target_os = "windows")]
 use crate::overlay::auto_detect::register_overlay_hwnd;
-use crate::overlay::auto_detect::{detect_rectangles, DetectedRect};
+#[cfg(target_os = "windows")]
+use core::ffi::c_void;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{COLORREF, HWND};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
+    WS_EX_LAYERED,
+};
+
+#[cfg(target_os = "windows")]
+const LAYERED_ALPHA: u8 = 255;
+use crate::overlay::auto_detect::{AutoDetectManager, DetectedRect};
 use crate::overlay::drawing::draw_handle;
 use crate::overlay::handles::{hit_test_handle, ResizeHandle};
 use crate::overlay::toolbar::{compute_toolbar_rect, draw_toolbar, hit_test_toolbar_button};
@@ -65,6 +77,7 @@ pub struct OverlayState {
     auto_hover: Option<usize>,                  // 当前鼠标所在的候选索引
     pending_auto_rect: Option<(u32, u32, u32, u32)>,
     drag_has_moved: bool,
+    auto_manager: AutoDetectManager,
 }
 
 impl OverlayState {
@@ -87,14 +100,7 @@ impl OverlayState {
         let window: &'static Window = Box::leak(Box::new(window));
 
         #[cfg(target_os = "windows")]
-        {
-            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(h) = window.window_handle() {
-                if let RawWindowHandle::Win32(win) = h.as_raw() {
-                    register_overlay_hwnd(win.hwnd.get() as isize);
-                }
-            }
-        }
+        Self::initialize_windows_overlay(window);
 
         // 禁用窗口淡入淡出动画，提升显隐响应（Windows）
         crate::windows_util::disable_window_transitions(window);
@@ -122,6 +128,7 @@ impl OverlayState {
             auto_hover: None,
             pending_auto_rect: None,
             drag_has_moved: false,
+            auto_manager: AutoDetectManager::new(),
         })
     }
 
@@ -164,6 +171,7 @@ impl OverlayState {
         self.auto_hover = None;
         self.pending_auto_rect = None;
         self.drag_has_moved = false;
+        self.auto_manager.invalidate();
         // 主动收缩可能的临时 Vec 容量（注意 allocator 可能仍保留，但可提示归还）
         // 由于我们把 Option<Vec<_>> 设为 None，这里暂无直接 shrink；若后续改为复用缓冲则可调用 shrink_to_fit。
     }
@@ -659,20 +667,24 @@ impl OverlayState {
     fn build_auto_rectangles(&mut self) {
         self.auto_hover = None;
         self.auto_rects.clear();
-        if let Some((w, h, ref buf)) = self.screenshot {
-            match detect_rectangles(w, h, buf) {
+        self.auto_manager.invalidate();
+    }
+
+    fn update_auto_hover(&mut self, cursor_x: i32, cursor_y: i32) -> bool {
+        if let Some((sw, sh, _)) = self.screenshot {
+            match self
+                .auto_manager
+                .detect_hover_rects(sw, sh, self.origin, (cursor_x, cursor_y))
+            {
                 Ok(rects) => {
                     self.auto_rects = rects;
                 }
                 Err(err) => {
-                    log::warn!("auto detect rectangles failed: {err}");
-                    self.auto_rects.clear();
+                    log::debug!("auto detect hover failed: {err}");
                 }
             }
         }
-    }
 
-    fn update_auto_hover(&mut self, cursor_x: i32, cursor_y: i32) -> bool {
         let mut new_hover = None;
         let mut smallest_area = i64::MAX;
         for (idx, rect) in self.auto_rects.iter().enumerate() {
@@ -738,6 +750,26 @@ impl OverlayState {
 }
 
 impl OverlayState {
+    #[cfg(target_os = "windows")]
+    fn initialize_windows_overlay(window: &'static Window) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(win) = handle.as_raw() {
+                unsafe {
+                    let hwnd = HWND(win.hwnd.get() as *mut c_void);
+                    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    let desired = style | WS_EX_LAYERED.0 as isize;
+                    if desired != style {
+                        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired);
+                    }
+                    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), LAYERED_ALPHA, LWA_ALPHA);
+                    register_overlay_hwnd(win.hwnd.get() as isize);
+                }
+            }
+        }
+    }
+
     fn execute_toolbar_button(&mut self, index: usize) -> OverlayAction {
         match index {
             0 => {

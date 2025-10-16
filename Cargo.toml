@@ -19,15 +19,17 @@ softbuffer = "0.4.0"
 tiny-skia = "0.11.4"
 bytemuck = { version = "1.16", features = ["derive"] }
 tray-icon = "0.21.1"
-opencv = { version = "0.96.0", features = ["imgproc"] }
-windows = { version = "0.62.1", features = [
+windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Threading",
   "Win32_Security",
+  "Win32_UI_Accessibility",
+  "Win32_System_Com",
 ] }
 muda = "0.17.1"
+scopeguard = "1.2"
 
 [build-dependencies]
 winres = "0.1"

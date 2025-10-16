@@ -42,6 +42,7 @@ These guidelines describe the CURRENT reality of the repository. Do not assume f
 - Lifetimes: Softbuffer surfaces require `'static`; current interim solution uses `Box::leak`. Do not refactor away unless replacing with a safe owner pattern across the event loop.
 - Color channels: Internal processing keeps RGBA. Presentation to softbuffer expects BGRA ordering packed in `u32`. Conversion is explicit (`renderer.as_bgra_u32`). Do not silently reorder outside these helpers.
 - Dim background: Overlay precomputes `dim_cache` once per capture; bright selection region uses original buffer.
+- Overlay window: created with `WS_EX_LAYERED` + fixed alpha so softbuffer can reuse the same composited surface; avoid stripping layered flags when tweaking window styles.
 - Paste windows: Pre-render focused/unfocused frame buffers (constant-time redraw during drag).
 - Event loop: Using deprecated `EventLoop::run` (winit 0.30) intentionally. Do not migrate to `run_app` unless we re-architect handler pattern.
 - Selection logic: Only update/redraw on cursor moved while dragging. Keep overlay responsive by minimizing allocations in that path.
@@ -71,7 +72,7 @@ These guidelines describe the CURRENT reality of the repository. Do not assume f
 - Hotkeys: Extend existing `subscribe_*` pattern returning a channel; keep registration centralized (avoid multiple managers/thread leaks).
 - Overlay Enhancements: Add new visual effects (mask, interior highlight) by layering additional write passes in `redraw`; reuse cached buffers when possible.
 - Annotations / Editing: Prefer operating on raw RGBA within `renderer.rs` or a new `annotate` module, only encoding to PNG at external boundaries.
-- Auto-Detection:
+- Auto-Detection: Currently combines Win32 window/child enumeration with optional UI Automation (controls). UIA path runs lazily per hovered window via `ElementFromPoint`; keep the logic lightweight (avoid deep recursion). Overlay detection now relies on `with_overlay_click_through` to temporarily set `WS_EX_TRANSPARENT`; do not introduce long-running logic inside that helper or leave the overlay non-interactive.
 - Avoid adding GUI frameworks (egui/wgpu/iced) unless the maintainer explicitly requests a UI layer.
 
 ## Example (Selection + Pin Flow)
@@ -97,6 +98,7 @@ match overlay.handle_event(&event) {
 ## Environment Variables
 
 - `SNIP_FORCE_BGRA`: Forces BGRA→RGBA conversion on captured buffer (diagnostics / platform quirks).
+- `SNIP_ASSUME_BGRA`: Skip RGBA→BGRA channel swapping in the renderer and treat the internal buffer as already BGRA-ordered.
 
 ## Style Guidelines
 
