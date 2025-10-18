@@ -62,16 +62,22 @@ use windows::core::BOOL;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, RPC_E_CHANGED_MODE};
 #[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
-    SetLayeredWindowAttributes, SetWindowLongPtrW, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
-    LWA_ALPHA, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    EnumChildWindows, GetAncestor, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic,
+    IsWindowVisible, SetLayeredWindowAttributes, SetWindowLongPtrW, WindowFromPoint, GA_ROOT,
+    GWL_EXSTYLE, GW_HWNDNEXT, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 
 #[derive(Clone, Debug)]
@@ -167,7 +173,7 @@ impl AutoDetectManager {
                 return Ok(Vec::new());
             }
 
-            let root = unsafe { GetAncestor(hwnd_at_point, GA_ROOT) };
+            let mut root = unsafe { GetAncestor(hwnd_at_point, GA_ROOT) };
             if root.0.is_null() {
                 log::debug!(
                     "auto_detect: GetAncestor returned null for hwnd {:?}",
@@ -177,14 +183,16 @@ impl AutoDetectManager {
                 return Ok(Vec::new());
             }
 
-            let overlay_raw = OVERLAY_HWND.load(Ordering::Relaxed);
-            if overlay_raw != 0 && root.0 as isize == overlay_raw {
-                log::debug!(
-                    "auto_detect: hit overlay window ({:?}); skipping detection",
-                    root
-                );
-                return Ok(Vec::new());
-            }
+            root = match resolve_root_window(root, screen_point, origin, width, height) {
+                Some(hwnd) => hwnd,
+                None => {
+                    log::debug!(
+                        "auto_detect: no suitable window under cursor after shadow filtering"
+                    );
+                    self.cache = None;
+                    return Ok(Vec::new());
+                }
+            };
 
             let need_rebuild = self
                 .cache
@@ -256,7 +264,33 @@ impl AutoDetectManager {
         };
 
         let element = unsafe { automation.ElementFromPoint(point)? };
-        let rect = unsafe { element.CurrentBoundingRectangle()? };
+        let host_hwnd = match resolve_element_window(&automation, &element)? {
+            Some(hwnd) => hwnd,
+            None => {
+                log::debug!(
+                    "auto_detect: UIA element has no host window at point ({}, {})",
+                    point.x,
+                    point.y
+                );
+                return Ok(None);
+            }
+        };
+
+        let element_root = unsafe { GetAncestor(host_hwnd, GA_ROOT) };
+        if element_root.0.is_null() || element_root != root {
+            log::debug!(
+                "auto_detect: UIA element belongs to different root {:?} (expected {:?})",
+                element_root,
+                root
+            );
+            return Ok(None);
+        }
+
+        let mut rect = unsafe { element.CurrentBoundingRectangle()? };
+
+        if let Some(clamped) = clamp_rect_to_window(&rect, host_hwnd) {
+            rect = clamped;
+        }
 
         let (x, y, w, h) = match normalize_rect(
             rect.left - origin.0,
@@ -475,6 +509,246 @@ fn is_rect_within_root(
         } else {
             Ok(true)
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_root_window(
+    start: HWND,
+    point: POINT,
+    origin: (i32, i32),
+    width: u32,
+    height: u32,
+) -> Option<HWND> {
+    let overlay_raw = OVERLAY_HWND.load(Ordering::Relaxed);
+    let mut current = start;
+    let mut steps = 0usize;
+
+    log::debug!(
+        "auto_detect: resolving root window starting from {:?} name {:?} at point ({}, {})",
+        start,
+        get_window_name(start).unwrap_or_default(),
+        point.x,
+        point.y
+    );
+
+    while !current.0.is_null() {
+        steps = steps.saturating_add(1);
+
+        if overlay_raw != 0 && current.0 as isize == overlay_raw {
+            log::debug!("auto_detect: skipping overlay window during root resolve");
+            current = next_window(current);
+            continue;
+        }
+
+        if unsafe { IsWindowVisible(current) }.as_bool() == false {
+            log::debug!(
+                "auto_detect: skipping invisible window {:?} name {:?}",
+                current,
+                get_window_name(current).unwrap_or_default()
+            );
+            current = next_window(current);
+            continue;
+        }
+
+        if unsafe { IsIconic(current) }.as_bool() {
+            log::debug!("auto_detect: skipping iconic window {:?}", current);
+            current = next_window(current);
+            continue;
+        }
+
+        if is_window_cloaked(current) {
+            log::debug!("auto_detect: skipping cloaked window {:?}", current);
+            current = next_window(current);
+            continue;
+        }
+
+        let (frame_rect, outer_rect, has_dwm_frame) = match query_window_bounds(current) {
+            Some(bounds) => bounds,
+            None => {
+                log::debug!("auto_detect: bounds unavailable for {:?}", current);
+                current = next_window(current);
+                continue;
+            }
+        };
+
+        if !point_in_rect(&point, &outer_rect) {
+            current = next_window(current);
+            continue;
+        }
+
+        if has_dwm_frame && !point_in_rect(&point, &frame_rect) {
+            log::debug!(
+                "auto_detect: point in shadow of window {:?}, name {:?} searching deeper",
+                current,
+                get_window_name(current).unwrap_or_default()
+            );
+            current = next_window(current);
+            continue;
+        }
+
+        if normalize_rect(
+            frame_rect.left - origin.0,
+            frame_rect.top - origin.1,
+            frame_rect.right - frame_rect.left,
+            frame_rect.bottom - frame_rect.top,
+            width,
+            height,
+            1,
+        )
+        .is_none()
+        {
+            log::debug!("auto_detect: window {:?} outside capture area", current);
+            current = next_window(current);
+            continue;
+        }
+
+        return Some(current);
+    }
+
+    log::debug!(
+        "auto_detect: exhausted z-order during root resolve after {} steps",
+        steps
+    );
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn query_window_bounds(hwnd: HWND) -> Option<(RECT, RECT, bool)> {
+    unsafe {
+        let mut outer: RECT = mem::zeroed();
+        if GetWindowRect(hwnd, &mut outer).is_err() {
+            return None;
+        }
+        if outer.left >= outer.right || outer.top >= outer.bottom {
+            return None;
+        }
+
+        let mut frame = outer;
+        let mut has_frame = false;
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut frame as *mut _ as *mut _,
+            mem::size_of::<RECT>() as u32,
+        )
+        .is_ok()
+        {
+            if frame.left < frame.right && frame.top < frame.bottom {
+                has_frame = true;
+            } else {
+                frame = outer;
+            }
+        }
+
+        Some((frame, outer, has_frame))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_window_cloaked(hwnd: HWND) -> bool {
+    unsafe {
+        let mut cloaked: u32 = 0;
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut _,
+            mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+        {
+            cloaked != 0
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn point_in_rect(point: &POINT, rect: &RECT) -> bool {
+    point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+}
+
+#[cfg(target_os = "windows")]
+fn next_window(hwnd: HWND) -> HWND {
+    log::debug!("auto_detect: moving to next window after {:?}", hwnd);
+    unsafe { GetWindow(hwnd, GW_HWNDNEXT).ok().unwrap_or(HWND::default()) }
+}
+
+#[cfg(target_os = "windows")]
+fn clamp_rect_to_window(rect: &RECT, hwnd: HWND) -> Option<RECT> {
+    let (frame_rect, _, _) = query_window_bounds(hwnd)?;
+    intersect_rect(rect, &frame_rect)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_element_window(
+    automation: &IUIAutomation,
+    element: &IUIAutomationElement,
+) -> Result<Option<HWND>> {
+    const MAX_ASCENT: usize = 256;
+    let mut current = element.clone();
+    let mut walker: Option<IUIAutomationTreeWalker> = None;
+
+    for _ in 0..MAX_ASCENT {
+        let handle = unsafe { current.CurrentNativeWindowHandle()? };
+        if !handle.0.is_null() {
+            return Ok(Some(handle));
+        }
+
+        let walker = match &walker {
+            Some(existing) => existing,
+            None => {
+                walker = Some(unsafe { automation.ControlViewWalker()? });
+                walker.as_ref().unwrap()
+            }
+        };
+
+        let parent = unsafe { walker.GetParentElement(&current) };
+        current = match parent {
+            Ok(parent_elem) => parent_elem,
+            Err(_) => return Ok(None),
+        };
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn intersect_rect(a: &RECT, b: &RECT) -> Option<RECT> {
+    let left = a.left.max(b.left);
+    let top = a.top.max(b.top);
+    let right = a.right.min(b.right);
+    let bottom = a.bottom.min(b.bottom);
+    if left < right && top < bottom {
+        Some(RECT {
+            left,
+            top,
+            right,
+            bottom,
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn get_window_name(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let mut length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(hwnd);
+        if length == 0 {
+            return None;
+        }
+        length += 1;
+        let mut buffer: Vec<u16> = vec![0; length as usize];
+        let read_length =
+            windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buffer);
+        if read_length == 0 {
+            return None;
+        }
+        buffer.truncate(read_length as usize);
+        String::from_utf16(&buffer).ok()
     }
 }
 
