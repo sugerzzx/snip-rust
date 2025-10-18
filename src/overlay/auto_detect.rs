@@ -66,12 +66,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, UIA_ButtonControlTypeId, UIA_DocumentControlTypeId,
-    UIA_EditControlTypeId, UIA_GroupControlTypeId, UIA_ListControlTypeId,
-    UIA_ListItemControlTypeId, UIA_MenuItemControlTypeId, UIA_TextControlTypeId,
-    UIA_ToolBarControlTypeId, UIA_WindowControlTypeId,
-};
+use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
@@ -85,17 +80,15 @@ pub struct DetectedRect {
     pub y: i32,
     pub width: i32,
     pub height: i32,
-    pub score: f32,
 }
 
 impl DetectedRect {
-    pub fn new(x: i32, y: i32, width: i32, height: i32, score: f32) -> Self {
+    pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
         Self {
             x,
             y,
             width,
             height,
-            score,
         }
     }
 
@@ -222,12 +215,11 @@ impl AutoDetectManager {
                 self.collect_hover_rect(root, screen_point, origin, width, height)?
             {
                 log::debug!(
-                    "auto_detect: UIA hover rect x={} y={} w={} h={} score={:.2}",
+                    "auto_detect: UIA hover rect x={} y={} w={} h={}",
                     hover_rect.x,
                     hover_rect.y,
                     hover_rect.width,
-                    hover_rect.height,
-                    hover_rect.score
+                    hover_rect.height
                 );
                 if !rects.iter().any(|r| {
                     r.x == hover_rect.x
@@ -240,10 +232,10 @@ impl AutoDetectManager {
             }
 
             rects.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.area().cmp(&b.area()))
+                a.area()
+                    .cmp(&b.area())
+                    .then_with(|| a.y.cmp(&b.y))
+                    .then_with(|| a.x.cmp(&b.x))
             });
 
             Ok(rects)
@@ -283,43 +275,7 @@ impl AutoDetectManager {
             return Ok(None);
         }
 
-        let control_type = unsafe { element.CurrentControlType()? };
-        let mut score = 0.70_f32;
-        let ctrl = control_type.0;
-        if ctrl == UIA_WindowControlTypeId.0 {
-            score = 0.92_f32;
-        } else if ctrl == UIA_DocumentControlTypeId.0 {
-            score = (score + 0.15_f32).min(0.97_f32);
-        } else if ctrl == UIA_EditControlTypeId.0 {
-            score += 0.12_f32;
-        } else if ctrl == UIA_TextControlTypeId.0 {
-            score += 0.08_f32;
-        } else if ctrl == UIA_ButtonControlTypeId.0 {
-            score = 0.68_f32;
-        } else if ctrl == UIA_ToolBarControlTypeId.0 {
-            score = 0.66_f32;
-        } else if ctrl == UIA_ListControlTypeId.0 || ctrl == UIA_ListItemControlTypeId.0 {
-            score += 0.08_f32;
-        } else if ctrl == UIA_MenuItemControlTypeId.0 {
-            score = 0.64_f32;
-        } else if ctrl == UIA_GroupControlTypeId.0 {
-            score -= 0.02_f32;
-        }
-
-        let total_area = (width as i64) * (height as i64);
-        if total_area > 0 {
-            let area = (w as i64) * (h as i64);
-            let factor = (area as f32 / total_area as f32).clamp(0.0, 1.0);
-            score += factor * 0.03_f32;
-        }
-
-        Ok(Some(DetectedRect::new(
-            x,
-            y,
-            w,
-            h,
-            score.clamp(0.45_f32, 0.97_f32),
-        )))
+        Ok(Some(DetectedRect::new(x, y, w, h)))
     }
 
     fn ensure_automation(&mut self) -> Result<Option<IUIAutomation>> {
@@ -372,7 +328,6 @@ fn collect_window_rects(
 ) -> Result<Vec<DetectedRect>> {
     let mut rects = Vec::new();
     let mut seen = HashSet::new();
-    let screen_area = (width as i64) * (height as i64);
 
     unsafe {
         let mut rect: RECT = mem::zeroed();
@@ -386,14 +341,7 @@ fn collect_window_rects(
                 height,
                 16,
             ) {
-                let area = (w as i64) * (h as i64);
-                let area_factor = if screen_area > 0 {
-                    (area as f32 / screen_area as f32).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let score = 0.85_f32 + area_factor * 0.10_f32;
-                rects.push(DetectedRect::new(x, y, w, h, score));
+                rects.push(DetectedRect::new(x, y, w, h));
                 seen.insert((x, y, w, h));
             }
         }
@@ -427,17 +375,17 @@ fn collect_window_rects(
             ) {
                 let key = (cx, cy, cw, ch);
                 if seen.insert(key) {
-                    rects.push(DetectedRect::new(cx, cy, cw, ch, 0.60_f32));
+                    rects.push(DetectedRect::new(cx, cy, cw, ch));
                 }
             }
         }
     }
 
     rects.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.area().cmp(&b.area()))
+        a.area()
+            .cmp(&b.area())
+            .then_with(|| a.y.cmp(&b.y))
+            .then_with(|| a.x.cmp(&b.x))
     });
 
     Ok(rects)
